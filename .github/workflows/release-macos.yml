@@ -1,0 +1,42 @@
+name: Package GravityBar for macOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-package:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Python & Extension verification
+        run: |
+          /usr/bin/python3 tests/test_switcher_core.py
+          node tests/test_extension.js
+
+      - name: Build Apple Silicon (arm64) GravityBar.app
+        run: |
+          ./build_app.sh
+          lipo -archs GravityBar.app/Contents/MacOS/GravityBar
+          codesign --verify --deep --strict GravityBar.app
+          GravityBar.app/Contents/MacOS/GravityBar --self-test
+
+      - name: Package the macOS disk image
+        run: |
+          mkdir -p dist dmg_stage
+          ditto GravityBar.app dmg_stage/GravityBar.app
+          ln -s /Applications dmg_stage/Applications
+          hdiutil create -volname "GravityBar" -srcfolder dmg_stage -ov -format UDZO dist/GravityBar-macOS-arm64.dmg
+          (cd dist && shasum -a 256 GravityBar-macOS-arm64.dmg > SHA256SUMS.txt)
+
+      - name: Upload Workflow Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GravityBar-macOS-arm64
+          path: dist/
