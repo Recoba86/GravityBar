@@ -41,3 +41,7 @@ Run `./install.sh` to install the app and set up the `gravitybar` CLI. The insta
 ممکن است مک در اولین اجرا از شما تأیید بخواهد. [راهنمای اپل](https://support.apple.com/en-us/102445)
 
 برای ساخت از روی کد منبع، دستور ساخت بخش انگلیسی را اجرا کنید.
+
+## License
+
+[MIT License](LICENSE) · Copyright (c) 2026 Recoba86
