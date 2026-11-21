@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  python-and-extension-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax checks
+        run: |
+          python3 -m py_compile switcher_core.py install_extension.py tests/test_switcher_core.py
+          node --check editor-extension/extension.js
+          bash -n build_app.sh
+          bash -n install.sh
+      - name: Run Python core test suite
+        run: python3 tests/test_switcher_core.py
+      - name: Run IDE extension test suite
+        run: node tests/test_extension.js
+
+  macos-native-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Python 3.9 compatibility
+        run: /usr/bin/python3 -m py_compile switcher_core.py && /usr/bin/python3 tests/test_switcher_core.py
+      - name: Build Apple Silicon (arm64) macOS app bundle
+        run: ./build_app.sh
+      - name: Verify Apple Silicon (arm64) binary, signature & native Swift self-tests
+        run: |
+          lipo -archs GravityBar.app/Contents/MacOS/GravityBar
+          codesign --verify --deep --strict GravityBar.app
+          GravityBar.app/Contents/MacOS/GravityBar --self-test
