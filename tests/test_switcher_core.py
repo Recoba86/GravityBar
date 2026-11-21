@@ -247,11 +247,11 @@ class SwitcherCoreTestSuite(unittest.TestCase):
         extensions = Path(self.tmpdir) / "extensions"
         source.mkdir()
         extensions.mkdir()
-        package = {"publisher": "m4tinbeigi", "name": "gravitybar", "version": "1.2.0"}
+        package = {"publisher": "recoba86", "name": "gravitybar", "version": "1.2.0"}
         (source / "package.json").write_text(json.dumps(package), encoding="utf-8")
         script = source / "extension.js"
         script.write_text("new code", encoding="utf-8")
-        target = extensions / "m4tinbeigi.gravitybar-1.2.0-arm64"
+        target = extensions / "recoba86.gravitybar-1.2.0-arm64"
         target.mkdir()
         (target / "extension.js").write_text("old code", encoding="utf-8")
         registry = extensions / "extensions.json"
@@ -263,12 +263,17 @@ class SwitcherCoreTestSuite(unittest.TestCase):
         self.assertEqual((target / "extension.js").read_text(encoding="utf-8"), "old code")
 
         peer = {"identifier": {"id": "other.extension"}, "version": "4.0.0"}
-        registry.write_text(json.dumps([peer]), encoding="utf-8")
+        previous_entries = [
+            peer,
+            {"identifier": {"id": "m4tinbeigi.gravitybar"}, "version": "1.1.0"},
+            {"identifier": {"id": "m4tinbeigi.antigravity-account-switcher"}, "version": "1.0.0"},
+        ]
+        registry.write_text(json.dumps(previous_entries), encoding="utf-8")
         with patch.object(install_extension.os, "replace", side_effect=OSError("simulated registry failure")):
             with self.assertRaises(OSError):
                 install_extension.register_extension(source, extensions)
         self.assertEqual((target / "extension.js").read_text(encoding="utf-8"), "old code")
-        self.assertEqual(json.loads(registry.read_text(encoding="utf-8")), [peer])
+        self.assertEqual(json.loads(registry.read_text(encoding="utf-8")), previous_entries)
 
         install_extension.register_extension(source, extensions)
         install_extension.register_extension(source, extensions)
@@ -276,6 +281,7 @@ class SwitcherCoreTestSuite(unittest.TestCase):
         entries = json.loads(registry.read_text(encoding="utf-8"))
         self.assertEqual(len(entries), 2)
         self.assertIn(peer, entries)
+        self.assertEqual(entries[1]["identifier"]["id"], "recoba86.gravitybar")
         self.assertEqual(entries[1]["version"], "1.2.0")
 
     def test_reused_label_preserves_other_account(self):

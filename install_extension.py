@@ -9,7 +9,7 @@ import tempfile
 import time
 
 
-LEGACY_ID = "m4tinbeigi.antigravity-account-switcher"
+LEGACY_IDS = ("m4tinbeigi.antigravity-account-switcher", "m4tinbeigi.gravitybar")
 
 
 def extension_id(entry):
@@ -31,7 +31,7 @@ def register_extension(source, extensions_dir):
         if not isinstance(entries, list):
             raise ValueError("extensions.json must contain a list")
 
-    entries = [entry for entry in entries if extension_id(entry) not in (package, LEGACY_ID)]
+    entries = [entry for entry in entries if extension_id(entry) not in (package, *LEGACY_IDS)]
     entries.append({
         "identifier": {"id": package},
         "version": version,

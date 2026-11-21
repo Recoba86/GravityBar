@@ -41,6 +41,7 @@ chmod +x "$OUT_BIN"
 
 cp "$DIR/switcher_core.py" "$APP_DIR/Contents/Resources/switcher_core.py"
 cp "$DIR/LICENSE" "$APP_DIR/Contents/Resources/LICENSE"
+cp "$DIR/THIRD_PARTY_NOTICES" "$APP_DIR/Contents/Resources/THIRD_PARTY_NOTICES"
 chmod +x "$APP_DIR/Contents/Resources/switcher_core.py"
 
 ICONSET_DIR="$BUILD_DIR/GravityBarIcon.iconset"
@@ -68,9 +69,9 @@ cat << 'PLIST' > "$APP_DIR/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.1.0</string>
+    <string>2.1.1</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>

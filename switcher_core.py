@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 GravityBar — Antigravity Account Switcher
-Created by Rick Sanchez (https://github.com/m4tinbeigi-official)
+Maintained by Recoba86 (https://github.com/Recoba86/GravityBar).
 Native Apple Silicon (arm64) 1-click Google account switcher for Google Antigravity on macOS.
 Interacts directly with macOS Keychain (service: 'gemini', account: 'antigravity').
 """
@@ -33,7 +33,7 @@ import threading
 ACCOUNTS_DIR = os.path.expanduser('~/.gemini/accounts')
 MANIFEST_PATH = os.path.join(ACCOUNTS_DIR, 'manifest.json')
 GITHUB_REPO_URL = "https://github.com/Recoba86/GravityBar"
-AUTHOR_NAME = "Rick Sanchez (@m4tinbeigi-official)"
+AUTHOR_NAME = "Recoba86"
 
 IS_MACOS = platform.system() == 'Darwin'
 
@@ -336,7 +336,7 @@ def ui_choose_from_list(prompt, items, title="GravityBar"):
 def show_about():
     """Display Creator and GitHub info dialog."""
     play_sound("Glass")
-    msg = f"🚀 GravityBar (Antigravity Account Switcher)\n\n👨‍💻 Creator: {AUTHOR_NAME}\n🌐 GitHub: {GITHUB_REPO_URL}\n\nIf you love this tool, please consider giving it a ⭐ Star on GitHub!"
+    msg = f"🚀 GravityBar (Antigravity Account Switcher)\n\n👨‍💻 Maintainer: {AUTHOR_NAME}\n🌐 GitHub: {GITHUB_REPO_URL}\n\nIf you love this tool, please consider giving it a ⭐ Star on GitHub!"
     res = ui_confirm("About GravityBar", msg, buttons=["Close", "⭐ Open GitHub & Star"], default_idx=2)
     if "Open GitHub" in res:
         open_github()
@@ -1432,7 +1432,7 @@ def generate_claude_html_dashboard(all_accounts_data, active_key):
   <div id="poolsContainer" style="display:flex; flex-direction:column; gap:10px;"></div>
 
   <div class="footer">
-    <div class="author-note">GravityBar · Antigravity Switcher by Rick Sanchez</div>
+    <div class="author-note">GravityBar · {AUTHOR_NAME}</div>
     <button class="btn btn-primary" id="refreshBtn" type="button">Reload snapshot</button>
   </div>
 </div>
@@ -2938,10 +2938,10 @@ def main_menu():
     if manifest:
         items.append("🗑 Remove a Saved Account")
     items.append("─────────────────────────────")
-    items.append("⭐ About & Star on GitHub (by Rick Sanchez)")
+    items.append("⭐ About & Star on GitHub")
         
     arch_info = get_arch_label()
-    prompt = f"🚀 GravityBar · Antigravity Account Switcher\n{arch_info} • by Rick Sanchez\n🟢 Active Account: {curr_display}{usage_info_line}\n\nChoose an action:"
+    prompt = f"🚀 GravityBar · Antigravity Account Switcher\n{arch_info}\n🟢 Active Account: {curr_display}{usage_info_line}\n\nChoose an action:"
     
     choice = ui_choose_from_list(prompt, items, title="GravityBar")
     if not choice or "──────" in choice:
@@ -3046,7 +3046,7 @@ if __name__ == '__main__':
         curr = get_current_keychain_token()
         active_key = find_active_account_key(m, curr)
         print(f"\n🚀 GravityBar — Antigravity Accounts [{get_arch_label()}]")
-        print(f"👨‍💻 Created by Rick Sanchez ({GITHUB_REPO_URL})\n")
+        print(f"👨‍💻 Maintained by {AUTHOR_NAME} ({GITHUB_REPO_URL})\n")
         for k, v in m.items():
             active = " [ACTIVE]" if k == active_key else ""
             print(f" • {k}{active} (Saved: {v.get('saved_at', 'N/A') if isinstance(v, dict) else 'N/A'})")
