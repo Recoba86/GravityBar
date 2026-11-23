@@ -2088,7 +2088,7 @@ final class OfficialAgyLoginSession: @unchecked Sendable {
             if !fallbackEmail.isEmpty && (root["id_token_email"] as? String)?.isEmpty != false {
                 root["id_token_email"] = fallbackEmail
             }
-            if let encoded = try? JSONSerialization.data(withJSONObject: root) {
+            if let encoded = try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]) {
                 return "go-keyring-base64:" + encoded.base64EncodedString()
             }
         } else if let access = json["access_token"] as? String, !access.isEmpty {
@@ -2113,8 +2113,27 @@ final class OfficialAgyLoginSession: @unchecked Sendable {
             if !fallbackEmail.isEmpty {
                 root["id_token_email"] = fallbackEmail
             }
-            if let encoded = try? JSONSerialization.data(withJSONObject: root) {
+            if let encoded = try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys]) {
                 return "go-keyring-base64:" + encoded.base64EncodedString()
+            }
+        }
+        return nil
+    }
+
+    static func readIsolatedCredential(in acpDirURL: URL) -> String? {
+        for name in ["acp_token.json", "antigravity-oauth-token"] {
+            let url = acpDirURL.appendingPathComponent(name)
+            if let data = try? Data(contentsOf: url), let token = normalizeCredentialData(data) {
+                return token
+            }
+        }
+
+        guard let files = FileManager.default.enumerator(at: acpDirURL, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        for case let url as URL in files where url.pathExtension == "json" && url.lastPathComponent != "settings.json" {
+            if let data = try? Data(contentsOf: url), let token = normalizeCredentialData(data) {
+                return token
             }
         }
         return nil
@@ -2339,24 +2358,7 @@ final class OfficialAgyLoginSession: @unchecked Sendable {
             return
         }
 
-        // 1. Prefer isolated acp_token.json written inside temporary profile
-        var resolvedToken: String?
-        let tokenURL = acpDirURL.appendingPathComponent("acp_token.json")
-        if let data = try? Data(contentsOf: tokenURL) {
-            resolvedToken = Self.normalizeCredentialData(data)
-        }
-        if resolvedToken == nil,
-           let enumerator = FileManager.default.enumerator(at: acpDirURL, includingPropertiesForKeys: nil) {
-            for case let fileURL as URL in enumerator where fileURL.pathExtension == "json" && fileURL.lastPathComponent != "settings.json" {
-                if let data = try? Data(contentsOf: fileURL),
-                   let norm = Self.normalizeCredentialData(data) {
-                    resolvedToken = norm
-                    break
-                }
-            }
-        }
-
-        guard let tok = resolvedToken else {
+        guard let tok = Self.readIsolatedCredential(in: acpDirURL) else {
             complete(.failure(OfficialAgyLoginError.missingCredential))
             return
         }
@@ -3310,6 +3312,20 @@ enum NativeSelfTest {
               check(normWrap?.hasPrefix("go-keyring-base64:") == true, "normalize envelope acp_token.json") else { return 1 }
         print("PASS: OfficialAgyLoginSession T3 Code isolated env & credential normalization")
 
+        let cliProfile = tmpRoot.appendingPathComponent("antigravity-acp")
+        do {
+            try fm.createDirectory(at: cliProfile, withIntermediateDirectories: true)
+            try Data(#"{"refresh_token":"fixture"}"#.utf8)
+                .write(to: cliProfile.appendingPathComponent("acp_token.json"))
+            try wrapData.write(to: cliProfile.appendingPathComponent("antigravity-oauth-token"))
+        } catch {
+            fputs("FAIL: Could not write CLI credential fixtures: \(error)\n", stderr)
+            return 1
+        }
+        let cliToken = OfficialAgyLoginSession.readIsolatedCredential(in: cliProfile)
+        guard check(cliToken != nil && cliToken == normWrap, "read the extensionless CLI credential") else { return 1 }
+        print("PASS: OfficialAgyLoginSession extensionless credential lookup")
+
         // 10. Test AppIconRenderer custom bundle icon dimensions
         let appIconImg = AppIconRenderer.renderIcon(size: 128)
         guard check(appIconImg.size == NSSize(width: 128, height: 128), "AppIconRenderer dimensions"),
@@ -3407,6 +3423,29 @@ enum NativeSelfTest {
                                 "empty quota response has no percentage or recommendation score")
         guard schedulerChecks.allSatisfy({ $0 }), savedRefresh, duplicateRejected, unavailable else { return 1 }
         print("PASS: Warmup quota guards and active account preservation")
+
+        // 12. Test FieldEditorShortcut Latin, Persian, and Control+V shortcuts
+        let shortcutChecks = [
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "v", keyCode: 9, modifierFlags: .command) == .paste, "English Cmd+V resolves to paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "v", keyCode: 9, modifierFlags: .control) == .paste, "English Ctrl+V resolves to paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "\u{16}", keyCode: 9, modifierFlags: .control) == .paste, "Control-char Ctrl+V resolves to paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "ر", keyCode: 9, modifierFlags: .command) == .paste, "Persian Cmd+V resolves to paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "ر", keyCode: 9, modifierFlags: .control) == .paste, "Persian Ctrl+V resolves to paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "ش", keyCode: 0, modifierFlags: .command) == .selectAll, "Persian Cmd+A resolves to selectAll"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "ز", keyCode: 8, modifierFlags: .command) == .copy, "Persian Cmd+C resolves to copy"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "ط", keyCode: 7, modifierFlags: .command) == .cut, "Persian Cmd+X resolves to cut"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "ظ", keyCode: 6, modifierFlags: .command) == .undo, "Persian Cmd+Z resolves to undo"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "ك", keyCode: 6, modifierFlags: [.command, .shift]) == .redo, "Persian Cmd+Shift+Z resolves to redo"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "Z", keyCode: 6, modifierFlags: [.command, .shift]) == .redo, "English Cmd+Shift+Z resolves to redo"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "k", keyCode: 9, modifierFlags: .command) == nil, "Dvorak Cmd+K at keyCode 9 does not trigger paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "v", keyCode: 47, modifierFlags: .command) == .paste, "Dvorak Cmd+V at keyCode 47 resolves to paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: ".", keyCode: 9, modifierFlags: .command) == nil, "Dvorak Cmd+. at keyCode 9 does not trigger paste"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "a", keyCode: 0, modifierFlags: .control) == nil, "Ctrl+A stays native line-start navigation"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "v", keyCode: 9, modifierFlags: [.command, .option]) == nil, "Cmd+Opt+V is ignored"),
+            check(FieldEditorShortcut.resolve(charactersIgnoringModifiers: "v", keyCode: 9, modifierFlags: []) == nil, "Plain v is ignored")
+        ]
+        guard shortcutChecks.allSatisfy({ $0 }) else { return 1 }
+        print("PASS: FieldEditorShortcut Latin, Persian, and Control+V shortcuts")
 
         return 0
     }

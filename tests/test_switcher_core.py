@@ -336,25 +336,27 @@ class SwitcherCoreTestSuite(unittest.TestCase):
 
     def test_official_login_reads_only_the_temporary_profile(self):
         program = Path(self.tmpdir) / "agy"
-        program.write_text(
-            "#!/usr/bin/python3\n"
-            "import os\nfrom pathlib import Path\n"
-            "print('https://accounts.google.com/fixture', flush=True)\n"
-            "if input() == 'test-code':\n"
-            "    p = Path(os.environ['GEMINI_HOME']) / 'antigravity-acp/acp_token.json'\n"
-            "    p.write_text('{\"access_token\": \"test-access\"}')\n"
-        )
-        program.chmod(0o700)
         existing = make_fake_token()
         self.store[(sc.KEYCHAIN_ACTIVE_SERVICE, sc.KEYCHAIN_ACTIVE_ACCOUNT)] = existing
-        with patch.object(sc, "find_agy_executable", return_value=str(program)), \
-             patch.object(sc, "open_url", return_value=True), \
-             patch.object(sc, "ui_input", return_value="test-code"), \
-             patch.object(sc, "extract_email_from_token", return_value="new@example.invalid"):
-            token, email = sc.agy_cli_login(timeout_secs=2)
-        self.assertEqual(email, "new@example.invalid")
-        self.assertEqual(json.loads(base64.b64decode(token.split(":", 1)[1]))["token"]["access_token"], "test-access")
-        self.assertEqual(sc.get_current_keychain_token(), existing)
+        for filename in ("acp_token.json", "antigravity-oauth-token"):
+            with self.subTest(filename=filename):
+                program.write_text(
+                    "#!/usr/bin/python3\n"
+                    "import os\nfrom pathlib import Path\n"
+                    "print('https://accounts.google.com/fixture', flush=True)\n"
+                    "if input() == 'test-code':\n"
+                    f"    p = Path(os.environ['GEMINI_HOME']) / 'antigravity-acp/{filename}'\n"
+                    "    p.write_text('{\"token\": {\"access_token\": \"test-access\"}}')\n"
+                )
+                program.chmod(0o700)
+                with patch.object(sc, "find_agy_executable", return_value=str(program)), \
+                     patch.object(sc, "open_url", return_value=True), \
+                     patch.object(sc, "ui_input", return_value="test-code"), \
+                     patch.object(sc, "extract_email_from_token", return_value="new@example.invalid"):
+                    token, email = sc.agy_cli_login(timeout_secs=2)
+                self.assertEqual(email, "new@example.invalid")
+                self.assertEqual(json.loads(base64.b64decode(token.split(":", 1)[1]))["token"]["access_token"], "test-access")
+                self.assertEqual(sc.get_current_keychain_token(), existing)
 
     def test_desktop_sign_in_cancel_restores_previous_credential(self):
         token = make_fake_token()

@@ -764,6 +764,87 @@ final class SwitcherStore: ObservableObject {
     }
 }
 
+// MARK: - Field Editor Keyboard Shortcuts
+
+enum FieldEditorShortcut: Equatable {
+    case paste
+    case copy
+    case cut
+    case selectAll
+    case undo
+    case redo
+
+    private static let ansiKeyLetters: [Int: String] = [
+        kVK_ANSI_A: "a",
+        kVK_ANSI_C: "c",
+        kVK_ANSI_V: "v",
+        kVK_ANSI_X: "x",
+        kVK_ANSI_Z: "z"
+    ]
+
+    nonisolated static func resolve(
+        charactersIgnoringModifiers: String?,
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> FieldEditorShortcut? {
+        let modifiers = modifierFlags.intersection([.command, .control, .option, .shift])
+        let raw = (charactersIgnoringModifiers ?? "").lowercased()
+        let letter: String?
+        if raw.count == 1, let scalar = raw.unicodeScalars.first, scalar.value >= 0x20 && scalar.value < 0x7F {
+            letter = raw
+        } else {
+            letter = ansiKeyLetters[Int(keyCode)]
+        }
+        guard let letter else { return nil }
+
+        if modifiers == .command {
+            switch letter {
+            case "v": return .paste
+            case "c": return .copy
+            case "x": return .cut
+            case "a": return .selectAll
+            case "z": return .undo
+            default: return nil
+            }
+        }
+        if modifiers == [.command, .shift], letter == "z" {
+            return .redo
+        }
+        if modifiers == .control, letter == "v" {
+            return .paste
+        }
+        return nil
+    }
+
+    @MainActor
+    func apply(to editor: NSTextView) -> Bool {
+        switch self {
+        case .paste:
+            guard editor.isEditable else { return false }
+            editor.paste(nil)
+            return true
+        case .copy:
+            editor.copy(nil)
+            return true
+        case .cut:
+            guard editor.isEditable else { return false }
+            editor.cut(nil)
+            return true
+        case .selectAll:
+            editor.selectAll(nil)
+            return true
+        case .undo:
+            guard editor.isEditable else { return false }
+            editor.undoManager?.undo()
+            return true
+        case .redo:
+            guard editor.isEditable else { return false }
+            editor.undoManager?.redo()
+            return true
+        }
+    }
+}
+
 // MARK: - Unified AppDelegate (Single-Instance Menu Bar Popover + Optional Window Mode)
 
 @MainActor
@@ -842,6 +923,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        installKeyboardMonitor()
         if store.enableGlobalHotkey {
             registerGlobalHotkey()
         }
@@ -966,7 +1048,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pop.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         }
         pop.contentViewController?.view.window?.makeKey()
-        installKeyboardMonitor()
         Task {
             await store.loadInitial()
         }
@@ -975,7 +1056,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func closePopover() {
         popover?.performClose(nil)
         store.isKeyboardNavigating = false
-        removeKeyboardMonitor()
     }
 
     private func activateApp() {
@@ -992,11 +1072,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         removeKeyboardMonitor()
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self else { return event }
-            if let pop = self.popover, !pop.isShown {
-                self.removeKeyboardMonitor()
-                return event
+            if let editor = (event.window?.firstResponder ?? NSApp.keyWindow?.firstResponder) as? NSTextView,
+               editor.isFieldEditor,
+               let shortcut = FieldEditorShortcut.resolve(
+                   charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                   keyCode: event.keyCode,
+                   modifierFlags: event.modifierFlags
+               ),
+               shortcut.apply(to: editor) {
+                return nil
             }
-            if self.handleKeyDown(event) {
+            if self.popover?.isShown == true, self.handleKeyDown(event) {
                 return nil
             }
             return event

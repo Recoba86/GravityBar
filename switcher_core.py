@@ -2660,7 +2660,7 @@ def _build_agy_login_env(base_env, profile_dir, temp_dir):
 
 
 def _normalize_official_credential(raw_text, fallback_email=""):
-    """Normalize acp_token.json or Keychain credential into canonical go-keyring-base64 format."""
+    """Normalize an Antigravity credential into canonical go-keyring-base64 format."""
     if not isinstance(raw_text, str):
         return None
     clean = raw_text.strip()
@@ -2774,11 +2774,13 @@ def agy_cli_login(timeout_secs=300):
                         process.kill()
                         process.wait()
 
-        token_file = acp_dir / "acp_token.json"
-        token = _normalize_official_credential(token_file.read_text(encoding="utf-8")) if token_file.is_file() else None
-        if not token:
-            raise RuntimeError("Antigravity CLI did not write a credential to the temporary profile.")
-        return token, extract_email_from_token(token) or "antigravity-account"
+        for filename in ("acp_token.json", "antigravity-oauth-token"):
+            token_file = acp_dir / filename
+            if token_file.is_file():
+                token = _normalize_official_credential(token_file.read_text(encoding="utf-8"))
+                if token:
+                    return token, extract_email_from_token(token) or "antigravity-account"
+        raise RuntimeError("Antigravity CLI did not write a credential to the temporary profile.")
 
 
 def add_account_wizard():
