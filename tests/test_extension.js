@@ -49,12 +49,14 @@ const statusBarMock = { show: () => {}, dispose: () => {}, text: '', tooltip: ''
 const fakeVscode = {
     env: { appRoot: '/Applications/Antigravity IDE.app/Contents/Resources/app' },
     StatusBarAlignment: { Right: 2 },
+    ProgressLocation: { Notification: 15 },
     QuickPickItemKind: { Separator: -1 },
     window: {
         createStatusBarItem: () => statusBarMock,
         showQuickPick: async (items) => { quickPickItemsSeen = items; return quickPickResult; },
         showInputBox: async () => inputBoxResult,
         showInformationMessage: () => {},
+        withProgress: async (_opts, task) => task(),
         showErrorMessage: message => errors.push(message)
     },
     commands: {
@@ -132,6 +134,15 @@ let ext;
         const saveCall = execCalls.find(c => c.args[0].startsWith('--save='));
         assert(saveCall, 'Expected --save execFile call');
         assert.deepStrictEqual(saveCall.args, [`--save=${label}`, '--quiet']);
+
+        // 3b. Quota check is a single manual action with progress
+        quickPickResult = { action: 'usage' };
+        await registeredCmd();
+        const usageCall = execCalls.find(c => c.args[0] === '--usage-gui');
+        assert(usageCall, 'Expected --usage-gui execFile call');
+        assert.deepStrictEqual(usageCall.args, ['--usage-gui', '--force-refresh', '--quiet']);
+        const statusCalls = execCalls.filter(c => c.args[0] === '--status-json');
+        assert(statusCalls.every(c => c.args.includes('--cached-only')), 'Status polling must never check quotas');
 
         // 4. Modern 5h/Weekly + Argon schema extraction
         const modernSummary = ext.extractQuotaSummary({

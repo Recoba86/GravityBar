@@ -4,7 +4,7 @@ import Foundation
 import SwiftUI
 @preconcurrency import UserNotifications
 
-// MARK: - Store (100% Native Keychain + Network Engine)
+// MARK: - Store (Native Keychain + official Antigravity CLI)
 
 @MainActor
 final class SwitcherStore: ObservableObject {
@@ -40,24 +40,18 @@ final class SwitcherStore: ObservableObject {
         didSet { onStatusUpdated?(lastPayload) }
     }
     @AppStorage("accountSortMode") var sortModeRaw: String = AccountSortMode.bestQuota.rawValue
-    @AppStorage("autoRefreshMinutes") var autoRefreshMinutes: Int = 5 {
-        didSet { onAutoRefreshChanged?(autoRefreshMinutes) }
-    }
     @AppStorage("enableGlobalHotkey") var enableGlobalHotkey: Bool = true {
         didSet { onHotkeySettingChanged?(enableGlobalHotkey) }
     }
     @AppStorage("lowQuotaAlertsEnabled") var lowQuotaAlertsEnabled: Bool = true
     @AppStorage("confirmBeforeSwitch") var confirmBeforeSwitch: Bool = false
     @AppStorage("playSounds") var playSounds: Bool = true
-    @AppStorage("autoWarmup5hEnabled") var autoWarmup5hEnabled: Bool = true
-    @Published var isWarmingUp: Bool = false
-    @Published var lastWarmupStatus: String = ""
+    @Published var quotaProgress: String?
+    @Published var quotaErrors: [String: String] = [:]
     @Published var launchAtLogin: Bool = false
 
     let manifestStore = NativeManifestStore()
-    let warmupStore: WarmupStateStore
     var onStatusUpdated: ((StatusPayload?) -> Void)?
-    var onAutoRefreshChanged: ((Int) -> Void)?
     var onHotkeySettingChanged: ((Bool) -> Void)?
     var onRequestPopoverOpen: (() -> Void)?
     var onRequestPopoverClose: (() -> Void)?
@@ -118,7 +112,6 @@ final class SwitcherStore: ObservableObject {
     }
 
     init() {
-        warmupStore = WarmupStateStore(manifestStore: manifestStore)
         launchAtLogin = FileManager.default.fileExists(atPath: launchAgentURL.path)
     }
 
@@ -176,43 +169,63 @@ final class SwitcherStore: ObservableObject {
         NSSound(named: NSSound.Name(name))?.play()
     }
 
-    func loadInitial(forceRefresh: Bool = false) async {
+    /// Shows saved accounts with their last checked quotas. Never contacts Google.
+    func loadInitial() async {
         guard !isRefreshing else { return }
         if accounts.isEmpty { isLoading = true }
-        await fetchStatus(forceRefresh: false, cachedOnly: true)
-        await fetchStatus(forceRefresh: forceRefresh, cachedOnly: false)
+        await fetchStatus()
     }
 
-    func refresh(force: Bool = true) async {
-        await fetchStatus(forceRefresh: force, cachedOnly: false)
+    /// Manual "Check Quotas": runs the official CLI once per account, a few seconds apart.
+    func refresh() async {
+        guard !isRefreshing else { return }
+        await fetchStatus(checkQuotas: true)
     }
 
-    private func fetchStatus(forceRefresh: Bool, cachedOnly: Bool, includeActiveSession: Bool = true) async {
+    private func fetchStatus(checkQuotas: Bool = false) async {
+        if checkQuotas && isRefreshing { return }
         statusRequestID += 1
         let requestID = statusRequestID
-        if !cachedOnly {
+        if checkQuotas {
             refreshRequestID = requestID
             isRefreshing = true
+            quotaProgress = nil
+            quotaErrors = [:]
         }
         let store = manifestStore
-        let payload = await Task.detached(priority: .userInitiated) {
+        let progress: @Sendable (Int, Int) -> Void = { [weak self] done, total in
+            Task { @MainActor in
+                guard let self, self.refreshRequestID == requestID else { return }
+                self.quotaProgress = "Checking \(done)/\(total)…"
+            }
+        }
+        let result = await Task.detached(priority: .userInitiated) {
             await NativeQuotaFetcher.loadStatusPayload(
-                store: store, forceRefresh: forceRefresh, cachedOnly: cachedOnly,
-                includeActiveSession: includeActiveSession
+                store: store, checkQuotas: checkQuotas, onProgress: checkQuotas ? progress : nil
             )
         }.value
 
         if refreshRequestID == requestID {
             refreshRequestID = nil
             isRefreshing = false
-            isLoading = false
+            quotaProgress = nil
         }
-        guard requestID > appliedStatusRequestID else { return }
+        isLoading = false
+        if checkQuotas {
+            quotaErrors = result.errors
+        }
+        guard requestID > appliedStatusRequestID else {
+            if checkQuotas { await fetchStatus() }
+            return
+        }
         appliedStatusRequestID = requestID
-        applyPayload(payload, fromCacheOnly: cachedOnly)
+        applyPayload(result.payload)
+        if let key = result.payload.activeKey, result.checkedAccounts.contains(key) {
+            evaluateLowQuotaNotification(result.payload)
+        }
     }
 
-    private func applyPayload(_ payload: StatusPayload, fromCacheOnly: Bool) {
+    private func applyPayload(_ payload: StatusPayload) {
         lastPayload = payload
         accounts = payload.accounts
         activeKey = payload.activeKey
@@ -220,8 +233,8 @@ final class SwitcherStore: ObservableObject {
         activeSessionUnsaved = payload.activeSessionUnsaved
         activeEmail = payload.activeEmail
         bestSwitchCandidate = payload.bestSwitchCandidate
-        if !fromCacheOnly {
-            lastUpdated = Date()
+        lastUpdated = accounts.compactMap { $0.usage?.checkedAt }.max().map {
+            Date(timeIntervalSince1970: TimeInterval($0))
         }
         if !accounts.isEmpty {
             isLoading = false
@@ -230,95 +243,6 @@ final class SwitcherStore: ObservableObject {
             selectedIndex = max(0, sortedAccounts.count - 1)
         }
         onStatusUpdated?(payload)
-        if !fromCacheOnly {
-            evaluateLowQuotaNotification(payload)
-            if autoWarmup5hEnabled { warmupStore.syncTrackedResets(accounts: payload.accounts) }
-        }
-    }
-
-    func checkScheduledWarmupTick() async {
-        guard autoWarmup5hEnabled, !isWarmingUp, let payload = lastPayload else { return }
-        let states = warmupStore.loadAll()
-        let targets = payload.accounts.filter { acc in
-            WarmupStateStore.shouldCheckQuota(
-                gemini5hPool: QuotaHelpers.gemini5hPool(acc.usage, requireReportedWindow: true),
-                state: states[acc.key]
-            )
-        }.map(\.key)
-        guard !targets.isEmpty else { return }
-        await runWarmup(forKeys: targets, isManual: false)
-    }
-
-    func triggerManualWarmup() async {
-        let targets = accounts.map(\.key)
-        await runWarmup(forKeys: targets, isManual: true)
-    }
-
-    private func runWarmup(forKeys targetKeys: [String], isManual: Bool) async {
-        guard !isWarmingUp, !targetKeys.isEmpty else { return }
-        isWarmingUp = true
-        defer { isWarmingUp = false }
-        let mStore = manifestStore
-        let wStore = warmupStore
-        wStore.recordWarmupAttempts(keys: targetKeys)
-
-        let eligibleKeys: [String]
-        if isManual {
-            eligibleKeys = targetKeys
-        } else {
-            let fresh = await Task.detached(priority: .utility) {
-                await NativeQuotaFetcher.loadStatusPayload(
-                    store: mStore, forceRefresh: true, cachedOnly: false, includeActiveSession: false
-                )
-            }.value
-            guard autoWarmup5hEnabled else { return }
-            wStore.syncTrackedResets(accounts: fresh.accounts)
-            eligibleKeys = fresh.accounts.filter { acc in
-                guard targetKeys.contains(acc.key) else { return false }
-                let pool = QuotaHelpers.gemini5hPool(acc.usage, requireReportedWindow: true)
-                let weekly = QuotaHelpers.geminiWeeklyPool(acc.usage)
-                return WarmupStateStore.quotaIsIdle(pool) && (weekly?.remainingPct ?? 100) > 0
-            }.map(\.key)
-            guard !eligibleKeys.isEmpty else { return }
-        }
-        let results = await Task.detached(priority: .userInitiated) { () -> [(key: String, ok: Bool, model: String, err: String?)] in
-            let manifest = mStore.loadManifest(migrate: false)
-            return await withTaskGroup(of: (key: String, ok: Bool, model: String, err: String?).self) { group in
-                for k in eligibleKeys {
-                    guard let entry = manifest[k], let tok = mStore.getAccountToken(entry) else { continue }
-                    group.addTask {
-                        let res = await NativeQuotaFetcher.sendGeminiWarmupPing(tokenStr: tok) { newTok in
-                            mStore.persistRefreshedToken(accountKey: k, newToken: newTok, replacingSavedToken: tok)
-                        }
-                        if res.ok {
-                            wStore.recordWarmupPing(key: k, modelDisplay: res.modelDisplay)
-                        }
-                        return (key: k, ok: res.ok, model: res.modelDisplay, err: res.error)
-                    }
-                }
-                var out: [(key: String, ok: Bool, model: String, err: String?)] = []
-                for await r in group {
-                    out.append(r)
-                }
-                return out
-            }
-        }.value
-
-        let succeeded = results.filter { $0.ok }
-        if let firstOk = succeeded.first {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "HH:mm"
-            lastWarmupStatus = "Last ping \(fmt.string(from: Date())) · \(firstOk.model) (\(succeeded.count)/\(eligibleKeys.count))"
-            if isManual {
-                playSystemSound("Glass")
-                showToast("⚡️ Gemini ping sent (\(firstOk.model))")
-            }
-            await fetchStatus(forceRefresh: true, cachedOnly: false, includeActiveSession: false)
-        } else {
-            let errMsg = results.compactMap { $0.err }.first ?? "Could not send 5h warmup ping."
-            lastWarmupStatus = "Ping failed: \(errMsg)"
-            if isManual { errorMessage = errMsg }
-        }
     }
 
     private func evaluateLowQuotaNotification(_ payload: StatusPayload) {
@@ -394,8 +318,7 @@ final class SwitcherStore: ObservableObject {
             } else {
                 errorMessage = "The active credential was updated. Open Antigravity to use \(key)."
             }
-            await fetchStatus(forceRefresh: false, cachedOnly: true)
-            await fetchStatus(forceRefresh: false, cachedOnly: false)
+            await fetchStatus()
         } else {
             switchingKey = nil
             errorMessage = result.1.isEmpty ? "Failed to update Keychain." : result.1
@@ -413,7 +336,7 @@ final class SwitcherStore: ObservableObject {
             errorMessage = "No active Antigravity session found in Keychain."
             return false
         }
-        let email = await NativeQuotaFetcher.extractEmailFromToken(token)
+        let email = NativeQuotaFetcher.emailFromToken(token)
             ?? label?.trimmingCharacters(in: .whitespacesAndNewlines)
             ?? "antigravity-account"
 
@@ -424,7 +347,7 @@ final class SwitcherStore: ObservableObject {
         if result.0 {
             playSystemSound("Glass")
             showToast("Account saved to Keychain")
-            await fetchStatus(forceRefresh: false, cachedOnly: false)
+            await fetchStatus()
             return true
         } else {
             errorMessage = result.1
@@ -441,7 +364,7 @@ final class SwitcherStore: ObservableObject {
         if result.0 {
             playSystemSound("Submarine")
             showToast("Removed \(key)")
-            await fetchStatus(forceRefresh: false, cachedOnly: true)
+            await fetchStatus()
         } else {
             errorMessage = result.1
         }
@@ -456,7 +379,7 @@ final class SwitcherStore: ObservableObject {
         if result.0 {
             playSystemSound("Glass")
             showToast("Renamed to \(newKey.trimmingCharacters(in: .whitespacesAndNewlines))")
-            await fetchStatus(forceRefresh: false, cachedOnly: true)
+            await fetchStatus()
             return true
         } else {
             errorMessage = result.1
@@ -471,7 +394,7 @@ final class SwitcherStore: ObservableObject {
             store.setPinned(key: account.key, pinned: nextPin)
         }.value
         if res.0 {
-            await fetchStatus(forceRefresh: false, cachedOnly: true)
+            await fetchStatus()
         } else {
             errorMessage = res.1
         }
@@ -484,7 +407,7 @@ final class SwitcherStore: ObservableObject {
         }.value
         if res.0 {
             showToast(plan.isEmpty ? "Plan set to Auto" : "Plan: \(plan)")
-            await fetchStatus(forceRefresh: false, cachedOnly: true)
+            await fetchStatus()
         } else {
             errorMessage = res.1
         }
@@ -674,7 +597,7 @@ final class SwitcherStore: ObservableObject {
     func checkWizardSignInNow() async {
         let run = wizardRun
         wizardBusy = true
-        await fetchStatus(forceRefresh: false, cachedOnly: false)
+        await fetchStatus()
         guard run == wizardRun else { return }
         wizardBusy = false
         evaluateWizardDetection()
@@ -692,11 +615,9 @@ final class SwitcherStore: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 if Task.isCancelled { break }
                 guard let self = self, self.screen == .addWizard, self.wizardStep == 2, self.wizardMode == .antigravityIDE else { break }
-                await self.fetchStatus(forceRefresh: false, cachedOnly: true)
+                await self.fetchStatus()
                 if Task.isCancelled { break }
                 if self.activeSessionUnsaved {
-                    await self.fetchStatus(forceRefresh: false, cachedOnly: false)
-                    if Task.isCancelled { break }
                     self.evaluateWizardDetection()
                     break
                 }
@@ -736,7 +657,7 @@ final class SwitcherStore: ObservableObject {
                 ok = true
                 playSystemSound("Glass")
                 showToast("Account saved to Keychain")
-                await fetchStatus(forceRefresh: true, cachedOnly: false)
+                await fetchStatus()
             } else {
                 errorMessage = res.1
             }
@@ -855,8 +776,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var popover: NSPopover?
     private var mainWindow: NSWindow?
-    private var refreshTimer: Timer?
-    private var warmupCheckTimer: Timer?
     private var isWindowMode: Bool = false
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandlerRef: EventHandlerRef?
@@ -891,9 +810,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.onStatusUpdated = { [weak self] payload in
             self?.updateStatusButton(payload: payload)
         }
-        store.onAutoRefreshChanged = { [weak self] mins in
-            self?.scheduleAutoRefresh(minutes: mins)
-        }
         store.onHotkeySettingChanged = { [weak self] enabled in
             if enabled {
                 self?.registerGlobalHotkey()
@@ -927,17 +843,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if store.enableGlobalHotkey {
             registerGlobalHotkey()
         }
-        scheduleAutoRefresh(minutes: store.autoRefreshMinutes)
-        scheduleWarmupCheck()
+        UserDefaults.standard.removeObject(forKey: "autoRefreshMinutes")
+        UserDefaults.standard.removeObject(forKey: "autoWarmup5hEnabled")
+        try? FileManager.default.removeItem(at: store.manifestStore.accountsDir.appendingPathComponent("warmup_state.json"))
         Task {
-            await store.loadInitial(forceRefresh: store.autoWarmup5hEnabled)
-            await store.checkScheduledWarmupTick()
+            await store.loadInitial()
         }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        refreshTimer?.invalidate()
-        warmupCheckTimer?.invalidate()
         unregisterGlobalHotkey()
         removeKeyboardMonitor()
         DistributedNotificationCenter.default().removeObserver(self)
@@ -1242,33 +1156,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 : "GravityBar · Not Signed In"
         }
     }
-
-    private func scheduleAutoRefresh(minutes: Int) {
-        refreshTimer?.invalidate()
-        refreshTimer = nil
-        guard minutes > 0 else { return }
-        let interval = TimeInterval(minutes * 60)
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.store.refresh(force: false)
-            }
-        }
-    }
-
-    private func scheduleWarmupCheck() {
-        warmupCheckTimer?.invalidate()
-        warmupCheckTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.store.checkScheduledWarmupTick()
-            }
-        }
-    }
 }
 
 // MARK: - Entry Point
 
 if CommandLine.arguments.contains("--self-test") {
-    exit(NativeSelfTest.runAll())
+    let result = NativeSelfTest.runAll()
+    guard result == 0 else { exit(result) }
+    Task.detached { exit(await NativeSelfTest.runQuotaProcessTests()) }
+    dispatchMain()
 }
 
 if let idx = CommandLine.arguments.firstIndex(of: "--generate-iconset"),

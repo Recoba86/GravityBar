@@ -112,6 +112,12 @@ struct UsageInfo: Codable, Sendable {
     let daily: QuotaPool?
     let weekly: QuotaPool?
     let pools: [QuotaPool]?
+    var checkedAt: Int? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case email, tier, daily, weekly, pools
+        case checkedAt = "checked_at"
+    }
 }
 
 struct QuotaPool: Codable, Identifiable, Sendable {
@@ -840,7 +846,8 @@ final class NativeManifestStore: @unchecked Sendable {
                     tier: clean,
                     daily: existing.daily,
                     weekly: existing.weekly,
-                    pools: existing.pools
+                    pools: existing.pools,
+                    checkedAt: existing.checkedAt
                 )
                 dict[key] = updated
                 return true
@@ -863,41 +870,48 @@ final class NativeManifestStore: @unchecked Sendable {
         guard let storeLock = acquireManifestLock() else { return }
         defer { try? storeLock.close() }
 
-        if let key = accountKey {
-            var manifest = _loadManifestUnlocked(migrate: false)
-            if var entry = manifest[key], let sid = entry.secretID, Self.validateSecretID(sid),
-               replacingSavedToken == nil || getAccountToken(entry) == replacingSavedToken {
-                let (ok, _) = NativeKeychain.set(service: NativeKeychain.savedService, account: sid, secret: cleanToken, keychainPath: keychainPath)
-                let rb = ok ? NativeKeychain.get(service: NativeKeychain.savedService, account: sid, keychainPath: keychainPath) : nil
-                if ok && rb?.trimmingCharacters(in: .whitespacesAndNewlines) == cleanToken {
-                    entry.tokenSHA256 = Self.sha256Hex(cleanToken)
-                    manifest[key] = entry
-                    try? _saveManifestUnlocked(manifest)
-                }
-            }
-        }
+        let manifest = _loadManifestUnlocked(migrate: false)
+        guard let key = accountKey, let entry = manifest[key], getAccountToken(entry) == replacingSavedToken else { return }
+        _persistRefreshedTokenUnlocked(key: key, newToken: cleanToken, manifest: manifest)
     }
 
-    func loadUsageCache() -> (data: [String: UsageInfo], mtime: Date?) {
+    private func _persistRefreshedTokenUnlocked(key: String, newToken: String, manifest: [String: ManifestEntry]) {
+        guard var entry = manifest[key], let sid = entry.secretID, Self.validateSecretID(sid) else { return }
+        let (ok, _) = NativeKeychain.set(service: NativeKeychain.savedService, account: sid, secret: newToken, keychainPath: keychainPath)
+        guard ok, NativeKeychain.get(service: NativeKeychain.savedService, account: sid, keychainPath: keychainPath) == newToken else { return }
+        entry.tokenSHA256 = Self.sha256Hex(newToken)
+        var updated = manifest
+        updated[key] = entry
+        try? _saveManifestUnlocked(updated)
+    }
+
+    func recordQuota(key: String, entry: ManifestEntry, token: String, usage: UsageInfo, updatedToken: String?) throws -> String? {
         lock.lock()
         defer { lock.unlock() }
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: cacheURL.path) else { return ([:], nil) }
-        let attrs = try? fm.attributesOfItem(atPath: cacheURL.path)
-        let mtime = attrs?[.modificationDate] as? Date
+        guard let storeLock = acquireManifestLock() else { return nil }
+        defer { try? storeLock.close() }
+
+        let manifest = _loadManifestUnlocked(migrate: false)
+        let candidates = entry.secretID.map { id in manifest.keys.filter { manifest[$0]?.secretID == id } } ?? [key]
+        guard let currentKey = candidates.first(where: { candidate in
+            manifest[candidate].flatMap(getAccountToken) == token
+        }) else { return nil }
+
+        var cache = loadUsageCache()
+        var checked = usage
+        checked.checkedAt = Int(Date().timeIntervalSince1970)
+        cache[currentKey] = checked
+        try writeSecureFile(url: cacheURL, data: JSONEncoder().encode(cache))
+        if let updatedToken {
+            _persistRefreshedTokenUnlocked(key: currentKey, newToken: updatedToken, manifest: manifest)
+        }
+        return currentKey
+    }
+
+    func loadUsageCache() -> [String: UsageInfo] {
         guard let raw = try? Data(contentsOf: cacheURL),
-              let decoded = try? JSONDecoder().decode([String: UsageInfo].self, from: raw) else {
-            return ([:], mtime)
-        }
-        return (decoded, mtime)
-    }
-
-    func saveUsageCache(_ cache: [String: UsageInfo]) {
-        lock.lock()
-        defer { lock.unlock() }
-        if let data = try? JSONEncoder().encode(cache) {
-            try? writeSecureFile(url: cacheURL, data: data)
-        }
+              let decoded = try? JSONDecoder().decode([String: UsageInfo].self, from: raw) else { return [:] }
+        return decoded
     }
 
     private func _mutateCacheUnlocked(_ mutator: (inout [String: UsageInfo]) -> Bool) {
@@ -912,27 +926,15 @@ final class NativeManifestStore: @unchecked Sendable {
     }
 }
 
-// MARK: - Native Quota Fetcher & OAuth Token Refresh
+// MARK: - Quota via the official Antigravity CLI
 
+// GravityBar never calls Google's internal APIs, refreshes OAuth tokens itself,
+// or presents itself as another client. Quota comes only from `agy -p /quota`,
+// run by the official CLI under its own identity and only on a user request.
 enum NativeQuotaFetcher {
-    private static let cidBytes: [UInt8] = [49, 48, 55, 49, 48, 48, 54, 48, 54, 48, 53, 57, 49, 45, 116, 109, 104, 115, 115, 105, 110, 50, 104, 50, 49, 108, 99, 114, 101, 50, 51, 53, 118, 116, 111, 108, 111, 106, 104, 52, 103, 52, 48, 51, 101, 112, 46, 97, 112, 112, 115, 46, 103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116, 46, 99, 111, 109]
-    private static let secBytes: [UInt8] = [71, 79, 67, 83, 80, 88, 45, 75, 53, 56, 70, 87, 82, 52, 56, 54, 76, 100, 76, 74, 49, 109, 76, 66, 56, 115, 88, 67, 52, 122, 54, 113, 68, 65, 102]
-
-    static var clientID: String { String(decoding: cidBytes, as: UTF8.self) }
-    static var clientSecret: String { String(decoding: secBytes, as: UTF8.self) }
-
-    private static let session: URLSession = {
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 4.0
-        cfg.timeoutIntervalForResource = 5.5
-        return URLSession(configuration: cfg)
-    }()
-
-    static func formEscape(_ s: String) -> String {
-        var allowed = CharacterSet.alphanumerics
-        allowed.insert(charactersIn: "-._~")
-        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
-    }
+    /// Pause between accounts during a manual "check all" so requests don't arrive in a burst.
+    static let interAccountDelaySeconds: UInt64 = 6
+    static let quotaTimeoutSeconds: TimeInterval = 45
 
     static func parseISODate(_ isoStr: String) -> Date? {
         let f1 = ISO8601DateFormatter()
@@ -984,237 +986,10 @@ enum NativeQuotaFetcher {
         return (parts.joined(separator: " "), localStr, shortStr, secs, isoStr)
     }
 
-    private static let dailyCloudCodeBase = "https://daily-cloudcode-pa.googleapis.com"
-    private static let prodCloudCodeBase = "https://cloudcode-pa.googleapis.com"
-    private static let minimumClientVersion = "2.25.0"
-    private static let defaultFallbackVersion = "2.33.0"
-    private static let nodeClientUA = "google-api-nodejs-client/10.3.0"
-    private static let nodeAPIClient = "gl-node/22.21.1"
-    private static let placeholderProject = "aicode-consumers"
 
-    private static func compareDottedVersions(_ a: String, _ b: String) -> Int {
-        func parseParts(_ v: String) -> [Int]? {
-            let core = v.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "-", maxSplits: 1).first.map(String.init) ?? ""
-            let rawParts = core.split(separator: ".")
-            guard !rawParts.isEmpty else { return nil }
-            var nums: [Int] = []
-            for p in rawParts {
-                guard let n = Int(p), n >= 0 else { return nil }
-                nums.append(n)
-            }
-            return nums
-        }
-        guard let pa = parseParts(a) else { return parseParts(b) == nil ? 0 : -1 }
-        guard let pb = parseParts(b) else { return 1 }
-        let count = max(pa.count, pb.count)
-        for i in 0..<count {
-            let x = i < pa.count ? pa[i] : 0
-            let y = i < pb.count ? pb[i] : 0
-            if x != y { return x < y ? -1 : 1 }
-        }
-        return 0
-    }
-
-    static func detectClientVersion() -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let plistPaths = [
-            "/Applications/Antigravity.app/Contents/Info.plist",
-            "/Applications/Antigravity IDE.app/Contents/Info.plist",
-            "\(home)/Applications/Antigravity.app/Contents/Info.plist"
-        ]
-        for path in plistPaths {
-            if let dict = NSDictionary(contentsOfFile: path),
-               let v = (dict["CFBundleShortVersionString"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-               !v.isEmpty {
-                return compareDottedVersions(v, minimumClientVersion) < 0 ? minimumClientVersion : v
-            }
-        }
-        return defaultFallbackVersion
-    }
-
-    private static func clientMetadata(version: String) -> [String: Any] {
-        [
-            "ideName": "antigravity",
-            "ideType": "ANTIGRAVITY",
-            "ideVersion": version,
-            "pluginVersion": version,
-            "platform": "DARWIN_ARM64",
-            "updateChannel": "stable",
-            "pluginType": "GEMINI"
-        ]
-    }
-
-    private static func assistHeaders(version: String) -> [String: String] {
-        [
-            "User-Agent": "antigravity/\(version) darwin/arm64 \(nodeClientUA)",
-            "x-goog-api-client": nodeAPIClient
-        ]
-    }
-
-    // Identifies the desktop hub subclient so Cloud Code exposes the separate Gemini 4 Argon pool.
-    static func quotaHeaders(version: String) -> [String: String] {
-        [
-            "User-Agent": "antigravity/hub/\(version) (aidev_client; os_type=darwin; arch=arm64)"
-        ]
-    }
-
-    private static func resolveQuotaTarget(from codeAssistData: [String: Any]?) -> (baseURL: String, body: Data) {
-        var proj = ""
-        if let rawProj = codeAssistData?["cloudaicompanionProject"] as? String {
-            proj = rawProj.trimmingCharacters(in: .whitespacesAndNewlines)
-        } else if let projDict = codeAssistData?["cloudaicompanionProject"] as? [String: Any],
-                  let pid = projDict["id"] as? String {
-            proj = pid.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if proj == placeholderProject {
-            proj = ""
-        }
-
-        var usesGcpTos = false
-        if let currentTier = codeAssistData?["currentTier"] as? [String: Any] {
-            if (currentTier["usesGcpTos"] as? Bool) == true {
-                usesGcpTos = true
-            } else if let currentId = currentTier["id"] as? String,
-                      let allowed = codeAssistData?["allowedTiers"] as? [[String: Any]] {
-                usesGcpTos = allowed.contains { ($0["id"] as? String) == currentId && ($0["usesGcpTos"] as? Bool) == true }
-            }
-        }
-
-        let base = (usesGcpTos && !proj.isEmpty) ? prodCloudCodeBase : dailyCloudCodeBase
-        let bodyObj: [String: Any] = proj.isEmpty ? [:] : ["project": proj]
-        let bodyData = (try? JSONSerialization.data(withJSONObject: bodyObj)) ?? Data("{}".utf8)
-        return (base, bodyData)
-    }
-
-    private static func postCloudCode(
-        _ endpoint: String,
-        baseURL: String = dailyCloudCodeBase,
-        body: Data = Data("{}".utf8),
-        headers: [String: String] = [:],
-        accessToken: String
-    ) async -> (status: Int, data: Data?) {
-        let trimmedBase = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
-        guard let url = URL(string: "\(trimmedBase)/v1internal:\(endpoint)") else {
-            return (-1, nil)
-        }
-        var req = URLRequest(url: url, timeoutInterval: 4.5)
-        req.httpMethod = "POST"
-        for (k, v) in headers {
-            req.setValue(v, forHTTPHeaderField: k)
-        }
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(endpoint == "streamGenerateContent?alt=sse" ? "text/event-stream" : "application/json",
-                     forHTTPHeaderField: "Accept")
-        req.httpBody = body
-
-        guard let (data, resp) = try? await session.data(for: req),
-              let http = resp as? HTTPURLResponse else {
-            return (-1, nil)
-        }
-        return (http.statusCode, data)
-    }
-
-    static func detectTierName(
-        modelsData: [String: Any],
-        codeAssistData: [String: Any]? = nil,
-        savedPlanLabel: String?
-    ) -> String {
-        if let saved = savedPlanLabel?.trimmingCharacters(in: .whitespacesAndNewlines), !saved.isEmpty {
-            return saved
-        }
-        var rawCandidates: [Any?] = []
-        if let paidTier = codeAssistData?["paidTier"] {
-            rawCandidates.append(paidTier)
-        }
-        rawCandidates.append(contentsOf: [
-            modelsData["userTier"],
-            modelsData["tier"],
-            modelsData["plan"],
-            modelsData["planType"],
-            modelsData["subscriptionTier"]
-        ])
-        if let userStatus = modelsData["userStatus"] as? [String: Any],
-           let planStatus = userStatus["planStatus"] as? [String: Any],
-           let planInfo = planStatus["planInfo"] as? [String: Any] {
-            rawCandidates.append(planInfo["planName"])
-            rawCandidates.append(planInfo["tierName"])
-        }
-        if let currentTier = codeAssistData?["currentTier"] {
-            rawCandidates.append(currentTier)
-        }
-
-        for item in rawCandidates {
-            var strVal: String?
-            if let dict = item as? [String: Any] {
-                strVal = (dict["displayName"] as? String)
-                    ?? (dict["name"] as? String)
-                    ?? (dict["tierName"] as? String)
-                    ?? (dict["planName"] as? String)
-                    ?? (dict["id"] as? String)
-            } else if let s = item as? String {
-                strVal = s
-            }
-            if let trimmed = strVal?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
-                switch trimmed.uppercased() {
-                case "FREE", "FREE-TIER", "FREE_TIER", "STANDARD", "STANDARD-TIER", "DEFAULT": return "Free"
-                case "PRO", "INDIVIDUAL_PRO", "GOOGLE_AI_PRO": return "Antigravity Pro"
-                case "G1-PRO-TIER", "G1_PRO_TIER": return "Google AI Pro"
-                case "ULTRA", "GOOGLE_AI_ULTRA": return "Antigravity Ultra"
-                case "G1-ULTRA-TIER", "G1_ULTRA_TIER": return "Google AI Ultra"
-                case "TEAMS", "ENTERPRISE", "BUSINESS": return "Antigravity Teams"
-                default: return trimmed
-                }
-            }
-        }
-        return ""
-    }
-
-    static func extractEmailFromToken(_ tokenStr: String) async -> String? {
-        guard tokenStr.hasPrefix("go-keyring-base64:") else { return nil }
-        let b64 = String(tokenStr.dropFirst("go-keyring-base64:".count))
-        guard let decoded = Data(base64Encoded: b64),
-              let root = try? JSONSerialization.jsonObject(with: decoded) as? [String: Any],
-              let tObj = root["token"] as? [String: Any],
-              let accessToken = tObj["access_token"] as? String, !accessToken.isEmpty else {
-            return nil
-        }
-        return await fetchUserInfoEmail(accessToken: accessToken)
-    }
-
-    private static func fetchUserInfoEmail(accessToken: String) async -> String? {
-        guard let url = URL(string: "https://www.googleapis.com/oauth2/v3/userinfo") else { return nil }
-        var req = URLRequest(url: url, timeoutInterval: 2.5)
-        req.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await session.data(for: req),
-              let http = resp as? HTTPURLResponse, http.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        return json["email"] as? String
-    }
-
-    private static func refreshAccessToken(refreshToken: String) async -> (accessToken: String, expiresIn: Int?)? {
-        guard let url = URL(string: "https://oauth2.googleapis.com/token") else { return nil }
-        var req = URLRequest(url: url, timeoutInterval: 4.0)
-        req.httpMethod = "POST"
-        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let body = [
-            "client_id=\(formEscape(clientID))",
-            "client_secret=\(formEscape(clientSecret))",
-            "grant_type=refresh_token",
-            "refresh_token=\(formEscape(refreshToken))"
-        ].joined(separator: "&")
-        req.httpBody = body.data(using: .utf8)
-
-        guard let (data, resp) = try? await session.data(for: req),
-              let http = resp as? HTTPURLResponse, http.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let access = json["access_token"] as? String, !access.isEmpty else {
-            return nil
-        }
-        let exp = (json["expires_in"] as? NSNumber)?.intValue
-        return (access, exp)
+    /// Reads the email that the official client stored inside the credential. No network call.
+    static func emailFromToken(_ tokenStr: String) -> String? {
+        NativeManifestStore.extractTokenIdentity(tokenStr).email
     }
 
     private static func parseWindowLabel(windowRaw: String?, bucketId: String?, displayName: String?) -> String {
@@ -1272,464 +1047,210 @@ enum NativeQuotaFetcher {
         )
     }
 
-    static func fetchUsage(
+    // MARK: Official CLI runner
+
+    enum QuotaCheckError: LocalizedError {
+        case cliNotFound
+        case badCredential
+        case failed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .cliNotFound:
+                return "Official Antigravity CLI (agy) was not found. Install it to check quotas."
+            case .badCredential:
+                return "Saved credential could not be prepared for the Antigravity CLI."
+            case .failed(let m):
+                return m
+            }
+        }
+    }
+
+    /// Converts a stored `go-keyring-base64:` credential into the JSON file format the official CLI writes.
+    static func credentialFileData(from tokenStr: String) -> Data? {
+        let prefix = "go-keyring-base64:"
+        let clean = tokenStr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard clean.hasPrefix(prefix),
+              let decoded = Data(base64Encoded: String(clean.dropFirst(prefix.count))),
+              let obj = try? JSONSerialization.jsonObject(with: decoded) as? [String: Any],
+              obj["token"] is [String: Any] else { return nil }
+        return decoded
+    }
+
+    /// Isolates the CLI profile and intercepts browser launches that use BROWSER or PATH.
+    static func quotaEnvironment(home: String, shimDir: String, baseEnv: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
+        var env: [String: String] = [:]
+        for key in ["LANG", "LC_ALL", "LC_CTYPE", "USER", "LOGNAME", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy"] {
+            if let v = baseEnv[key] { env[key] = v }
+        }
+        env["HOME"] = home
+        env["TMPDIR"] = home + "/tmp"
+        env["PATH"] = shimDir + ":/usr/bin:/bin:/usr/sbin:/sbin"
+        env["BROWSER"] = shimDir + "/open"
+        env["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"] = "1"
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
+        return env
+    }
+
+    /// Runs `agy -p /quota --output-format json` for one credential in an isolated profile.
+    /// Returns the parsed usage plus the credential the CLI left behind (it may have refreshed it).
+    static func runQuotaCheck(
         tokenStr: String,
         knownEmail: String?,
         savedPlanLabel: String?,
-        onTokenRefreshed: ((String) -> Void)? = nil
-    ) async -> UsageInfo? {
-        guard tokenStr.hasPrefix("go-keyring-base64:") else { return nil }
-        let b64 = String(tokenStr.dropFirst("go-keyring-base64:".count))
-        guard let rawData = Data(base64Encoded: b64),
-              var rootObj = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any],
-              var tObj = rootObj["token"] as? [String: Any],
-              var accessToken = tObj["access_token"] as? String else {
+        executable: String? = OfficialAgyLoginSession.findAgyExecutable(),
+        timeout: TimeInterval = quotaTimeoutSeconds
+    ) async -> Result<(usage: UsageInfo, updatedToken: String?), QuotaCheckError> {
+        guard let agy = executable else { return .failure(.cliNotFound) }
+        guard let credData = credentialFileData(from: tokenStr) else { return .failure(.badCredential) }
+
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("gravitybar_quota_\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: root) }
+        let shimDir = root.appendingPathComponent("bin")
+        let cliDir = root.appendingPathComponent(".gemini/antigravity-cli")
+        let tokenURL = cliDir.appendingPathComponent("antigravity-oauth-token")
+        let stdoutURL = root.appendingPathComponent("stdout")
+        let stderrURL = root.appendingPathComponent("stderr")
+        let stdout: FileHandle
+        let stderr: FileHandle
+        do {
+            for dir in [root, shimDir, cliDir, root.appendingPathComponent("tmp")] {
+                try fm.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            }
+            let shim = shimDir.appendingPathComponent("open")
+            try Data("#!/bin/sh\nexit 0\n".utf8).write(to: shim)
+            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: shim.path)
+            try credData.write(to: tokenURL, options: .atomic)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tokenURL.path)
+            try Data().write(to: stdoutURL)
+            try Data().write(to: stderrURL)
+            stdout = try FileHandle(forWritingTo: stdoutURL)
+            stderr = try FileHandle(forWritingTo: stderrURL)
+        } catch {
+            return .failure(.failed("Could not prepare a temporary profile: \(error.localizedDescription)"))
+        }
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: agy)
+        proc.arguments = ["-p", "/quota", "--output-format", "json", "--print-timeout", "30s"]
+        proc.currentDirectoryURL = root
+        proc.environment = quotaEnvironment(home: root.path, shimDir: shimDir.path)
+        // Files let the check finish even when a child of agy inherits the output descriptors.
+        proc.standardOutput = stdout
+        proc.standardError = stderr
+        proc.standardInput = FileHandle.nullDevice
+
+        do {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                let deadline = DispatchWorkItem {
+                    if proc.isRunning { kill(proc.processIdentifier, SIGKILL) }
+                }
+                proc.terminationHandler = { _ in
+                    deadline.cancel()
+                    cont.resume()
+                }
+                do {
+                    try proc.run()
+                } catch {
+                    proc.terminationHandler = nil
+                    cont.resume(throwing: error)
+                    return
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: deadline)
+            }
+        } catch {
+            return .failure(.failed("Could not start the Antigravity CLI: \(error.localizedDescription)"))
+        }
+
+        if proc.terminationReason == .uncaughtSignal && proc.terminationStatus == SIGKILL {
+            return .failure(.failed("The Antigravity CLI timed out."))
+        }
+        let output = readQuotaOutput(stdoutURL)
+        guard proc.terminationStatus == 0,
+              let usage = parseQuotaJSON(output, resolvedEmail: knownEmail, savedPlanLabel: savedPlanLabel) else {
+            let text = String(decoding: output + readQuotaOutput(stderrURL), as: UTF8.self)
+            if text.contains("accounts.google.com") || text.localizedCaseInsensitiveContains("authentication") {
+                return .failure(.failed("Sign-in expired. Add this account again."))
+            }
+            return .failure(.failed("The Antigravity CLI did not report a quota."))
+        }
+
+        var updated: String?
+        if let newData = try? Data(contentsOf: tokenURL), newData != credData,
+           let obj = try? JSONSerialization.jsonObject(with: newData) as? [String: Any],
+           obj["token"] is [String: Any] {
+            updated = "go-keyring-base64:" + newData.base64EncodedString()
+        }
+        return .success((usage, updated))
+    }
+
+    private static func readQuotaOutput(_ url: URL) -> Data {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return Data() }
+        defer { try? handle.close() }
+        return (try? handle.read(upToCount: 1_000_000)) ?? Data()
+    }
+
+    /// Parses `agy -p /quota --output-format json` output (`command.data.groups[].buckets[]`).
+    static func parseQuotaJSON(_ data: Data, resolvedEmail: String?, savedPlanLabel: String?) -> UsageInfo? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (root["status"] as? String)?.uppercased() == "SUCCESS",
+              let command = root["command"] as? [String: Any],
+              let name = command["name"] as? String, name == "usage" || name == "quota",
+              let payload = command["data"] as? [String: Any],
+              let groups = payload["groups"] as? [[String: Any]] else {
             return nil
-        }
-        let refreshToken = tObj["refresh_token"] as? String
-
-        var summaryJSON: [String: Any]?
-        var modelsJSON: [String: Any]?
-        var codeAssistJSON: [String: Any]?
-        var refreshedTokenString: String?
-        let clientVersion = detectClientVersion()
-
-        for attempt in 0..<2 {
-            let tokenForAttempt = accessToken
-            let lcaBodyObj: [String: Any] = [
-                "metadata": clientMetadata(version: clientVersion),
-                "mode": "FULL_ELIGIBILITY_CHECK"
-            ]
-            let lcaBody = (try? JSONSerialization.data(withJSONObject: lcaBodyObj))
-                ?? Data("{\"metadata\":{\"ideType\":\"ANTIGRAVITY\"},\"mode\":\"FULL_ELIGIBILITY_CHECK\"}".utf8)
-            let lcaRes = await postCloudCode(
-                "loadCodeAssist",
-                baseURL: dailyCloudCodeBase,
-                body: lcaBody,
-                headers: assistHeaders(version: clientVersion),
-                accessToken: tokenForAttempt
-            )
-            if lcaRes.status == 200, let ld = lcaRes.data,
-               let parsedLca = try? JSONSerialization.jsonObject(with: ld) as? [String: Any] {
-                codeAssistJSON = parsedLca
-            }
-
-            if !(attempt == 0 && lcaRes.status == 401) {
-                let target = resolveQuotaTarget(from: codeAssistJSON)
-                let qHeaders = quotaHeaders(version: clientVersion)
-                async let sumTask = postCloudCode(
-                    "retrieveUserQuotaSummary",
-                    baseURL: target.baseURL,
-                    body: target.body,
-                    headers: qHeaders,
-                    accessToken: tokenForAttempt
-                )
-                async let modTask = postCloudCode(
-                    "fetchAvailableModels",
-                    baseURL: target.baseURL,
-                    body: target.body,
-                    headers: qHeaders,
-                    accessToken: tokenForAttempt
-                )
-                let (sumRes, modRes) = await (sumTask, modTask)
-
-                if sumRes.status == 200, let sd = sumRes.data,
-                   let parsedSum = try? JSONSerialization.jsonObject(with: sd) as? [String: Any] {
-                    summaryJSON = parsedSum
-                }
-                if modRes.status == 200, let md = modRes.data,
-                   let parsedMod = try? JSONSerialization.jsonObject(with: md) as? [String: Any] {
-                    modelsJSON = parsedMod
-                }
-
-                if summaryJSON != nil || modelsJSON != nil {
-                    break
-                }
-            }
-
-            if attempt == 0, let rf = refreshToken, !rf.isEmpty,
-               let refreshed = await refreshAccessToken(refreshToken: rf) {
-                accessToken = refreshed.accessToken
-                tObj["access_token"] = refreshed.accessToken
-                if let expSecs = refreshed.expiresIn {
-                    let expDate = Date().addingTimeInterval(TimeInterval(expSecs))
-                    let fmt = ISO8601DateFormatter()
-                    fmt.formatOptions = [.withInternetDateTime]
-                    tObj["expiry"] = fmt.string(from: expDate)
-                }
-                rootObj["token"] = tObj
-                if let reencoded = try? JSONSerialization.data(withJSONObject: rootObj) {
-                    refreshedTokenString = "go-keyring-base64:" + reencoded.base64EncodedString()
-                }
-            } else {
-                return nil
-            }
-        }
-
-        guard summaryJSON != nil || modelsJSON != nil else { return nil }
-
-        if let rfTok = refreshedTokenString {
-            onTokenRefreshed?(rfTok)
-        }
-
-        var resolvedEmail = knownEmail
-        if resolvedEmail == nil || resolvedEmail?.isEmpty == true {
-            resolvedEmail = await fetchUserInfoEmail(accessToken: accessToken)
-        }
-
-        return parseUsage(
-            summaryJSON: summaryJSON,
-            modelsJSON: modelsJSON,
-            codeAssistJSON: codeAssistJSON,
-            resolvedEmail: resolvedEmail,
-            savedPlanLabel: savedPlanLabel
-        )
-    }
-
-    static func extractRawProjectID(from codeAssistData: [String: Any]?) -> String {
-        if let rawProj = codeAssistData?["cloudaicompanionProject"] as? String {
-            let clean = rawProj.trimmingCharacters(in: .whitespacesAndNewlines)
-            return clean == placeholderProject ? "" : clean
-        }
-        if let projDict = codeAssistData?["cloudaicompanionProject"] as? [String: Any],
-           let pid = projDict["id"] as? String {
-            let clean = pid.trimmingCharacters(in: .whitespacesAndNewlines)
-            return clean == placeholderProject ? "" : clean
-        }
-        return ""
-    }
-
-    static func warmupGeminiModels(from modelsJSON: [String: Any]?) -> [(modelId: String, displayName: String)] {
-        let models = modelsJSON?["models"] as? [String: Any] ?? [:]
-        var ranked: [Int: (String, String)] = [:]
-        for id in models.keys.sorted() {
-            guard let info = models[id] as? [String: Any], info["isInternal"] as? Bool != true else { continue }
-            let display = (info["displayName"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let name = (id + " " + display).lowercased()
-            guard name.contains("gemini"),
-                  !["argon", "claude", "gpt", "tab_"].contains(where: name.contains) else { continue }
-
-            let priority: Int
-            if name.contains("hydrogen") {
-                priority = 0
-            } else if !name.contains("flash") {
-                continue
-            } else if name.contains("3.8") {
-                priority = name.contains("low") || name.contains("lite") ? 1 : 2
-            } else {
-                priority = 3
-            }
-            if ranked[priority] == nil {
-                ranked[priority] = (id, display.isEmpty ? id : display)
-            }
-        }
-        return ranked.keys.sorted().compactMap { ranked[$0] }
-    }
-
-    static func hasWarmupGeneration(_ data: Data?, streaming: Bool) -> Bool {
-        func hasCandidates(_ data: Data) -> Bool {
-            guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  body["error"] == nil else { return false }
-            let response = body["response"] as? [String: Any] ?? body
-            return (response["candidates"] as? [[String: Any]])?.isEmpty == false
-        }
-
-        guard let data else { return false }
-        if !streaming { return hasCandidates(data) }
-        guard let text = String(data: data, encoding: .utf8) else { return false }
-        return text.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n\n").contains { event in
-            let json = event.split(separator: "\n")
-                .filter { $0.hasPrefix("data:") }
-                .map { $0.dropFirst(5) }
-                .joined(separator: "\n")
-            return hasCandidates(Data(json.utf8))
-        }
-    }
-
-    static func sendGeminiWarmupPing(
-        tokenStr: String,
-        onTokenRefreshed: ((String) -> Void)? = nil
-    ) async -> (ok: Bool, modelDisplay: String, error: String?) {
-        guard tokenStr.hasPrefix("go-keyring-base64:") else {
-            return (false, "", "Invalid credential format")
-        }
-        let b64 = String(tokenStr.dropFirst("go-keyring-base64:".count))
-        guard let rawData = Data(base64Encoded: b64),
-              var rootObj = try? JSONSerialization.jsonObject(with: rawData) as? [String: Any],
-              var tObj = rootObj["token"] as? [String: Any],
-              var accessToken = tObj["access_token"] as? String else {
-            return (false, "", "Malformed credential payload")
-        }
-        let refreshToken = tObj["refresh_token"] as? String
-        let clientVersion = detectClientVersion()
-
-        var codeAssistJSON: [String: Any]?
-        var refreshedTokenString: String?
-        var loadStatus = -1
-
-        for attempt in 0..<2 {
-            let lcaBodyObj: [String: Any] = [
-                "metadata": clientMetadata(version: clientVersion),
-                "mode": "FULL_ELIGIBILITY_CHECK"
-            ]
-            let lcaBody = (try? JSONSerialization.data(withJSONObject: lcaBodyObj))
-                ?? Data("{\"metadata\":{\"ideType\":\"ANTIGRAVITY\"},\"mode\":\"FULL_ELIGIBILITY_CHECK\"}".utf8)
-            let lcaRes = await postCloudCode(
-                "loadCodeAssist",
-                baseURL: dailyCloudCodeBase,
-                body: lcaBody,
-                headers: assistHeaders(version: clientVersion),
-                accessToken: accessToken
-            )
-            if lcaRes.status == 401 && attempt == 0 {
-                if let rf = refreshToken, !rf.isEmpty,
-                   let refreshed = await refreshAccessToken(refreshToken: rf) {
-                    accessToken = refreshed.accessToken
-                    tObj["access_token"] = refreshed.accessToken
-                    if let expSecs = refreshed.expiresIn {
-                        let expDate = Date().addingTimeInterval(TimeInterval(expSecs))
-                        let fmt = ISO8601DateFormatter()
-                        fmt.formatOptions = [.withInternetDateTime]
-                        tObj["expiry"] = fmt.string(from: expDate)
-                    }
-                    rootObj["token"] = tObj
-                    if let reencoded = try? JSONSerialization.data(withJSONObject: rootObj) {
-                        refreshedTokenString = "go-keyring-base64:" + reencoded.base64EncodedString()
-                    }
-                    continue
-                } else {
-                    return (false, "", "OAuth token expired and refresh failed")
-                }
-            }
-            if lcaRes.status == 200, let ld = lcaRes.data,
-               let parsed = try? JSONSerialization.jsonObject(with: ld) as? [String: Any] {
-                codeAssistJSON = parsed
-            }
-            loadStatus = lcaRes.status
-            break
-        }
-
-        if let rfTok = refreshedTokenString {
-            onTokenRefreshed?(rfTok)
-        }
-        guard let codeAssistJSON else {
-            return (false, "", "Could not load Cloud Code account (status \(loadStatus))")
-        }
-
-        let target = resolveQuotaTarget(from: codeAssistJSON)
-        let rawProject = extractRawProjectID(from: codeAssistJSON)
-        let modRes = await postCloudCode(
-            "fetchAvailableModels",
-            baseURL: target.baseURL,
-            body: target.body,
-            headers: quotaHeaders(version: clientVersion),
-            accessToken: accessToken
-        )
-        guard modRes.status == 200, let modelData = modRes.data,
-              let models = try? JSONSerialization.jsonObject(with: modelData) as? [String: Any] else {
-            return (false, "", "Could not fetch Cloud Code models (status \(modRes.status))")
-        }
-        let candidates = warmupGeminiModels(from: models)
-        guard let first = candidates.first else {
-            return (false, "", "No eligible Gemini warmup model was advertised")
-        }
-
-        let headers = assistHeaders(version: clientVersion)
-        var endpoint = "generateContent"
-        var lastStatus = -1
-        for candidate in candidates {
-            var payload: [String: Any] = [
-                "model": candidate.modelId,
-                "request": [
-                    "contents": [["role": "user", "parts": [["text": "ok"]]]],
-                    "generationConfig": [
-                        "maxOutputTokens": 1,
-                        "temperature": 0.0,
-                        "thinkingConfig": ["thinkingLevel": "LOW"]
-                    ]
-                ]
-            ]
-            if !rawProject.isEmpty { payload["project"] = rawProject }
-            guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
-                return (false, candidate.displayName, "Could not encode warmup request")
-            }
-
-            func post(_ method: String) async -> (status: Int, data: Data?) {
-                await postCloudCode(method, baseURL: target.baseURL, body: data, headers: headers, accessToken: accessToken)
-            }
-            var streaming = endpoint != "generateContent"
-            var reply = await post(endpoint)
-            if !streaming && [404, 405, 501].contains(reply.status) {
-                let streamEndpoint = "streamGenerateContent?alt=sse"
-                reply = await post(streamEndpoint)
-                streaming = true
-                if reply.status != 404 { endpoint = streamEndpoint }
-            }
-            lastStatus = reply.status
-            if reply.status == 200 {
-                if hasWarmupGeneration(reply.data, streaming: streaming) {
-                    return (true, candidate.displayName, nil)
-                }
-                return (false, candidate.displayName, "Cloud Code did not confirm generation")
-            }
-            if reply.status != 400 && reply.status != 404 {
-                return (false, candidate.displayName, "Cloud Code returned status \(reply.status)")
-            }
-        }
-        return (false, first.displayName, "Cloud Code returned status \(lastStatus)")
-    }
-
-    static func parseUsage(
-        summaryJSON: [String: Any]?,
-        modelsJSON: [String: Any]?,
-        codeAssistJSON: [String: Any]?,
-        resolvedEmail: String?,
-        savedPlanLabel: String?
-    ) -> UsageInfo? {
-        guard summaryJSON != nil || modelsJSON != nil else { return nil }
-        let modelsData = modelsJSON ?? [:]
-        let tierName = detectTierName(modelsData: modelsData, codeAssistData: codeAssistJSON, savedPlanLabel: savedPlanLabel)
-
-        func fallbackGroupName(forBucketID bid: String) -> String {
-            let low = bid.lowercased()
-            if low.contains("argon") { return "Gemini 4 Argon" }
-            if low.contains("claude") || low.contains("3p") || low.contains("gpt") { return "Claude and GPT models" }
-            if low.contains("gemini") { return "Gemini Models" }
-            return "Models"
         }
 
         var pools: [QuotaPool] = []
-
-        if let groups = summaryJSON?["groups"] as? [[String: Any]], !groups.isEmpty {
-            for grp in groups {
-                let dispGroup = (grp["displayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let groupModels = parseGroupModels(description: grp["description"] as? String)
-                let buckets = (grp["buckets"] as? [[String: Any]]) ?? []
-                var grpPools: [QuotaPool] = []
-
-                for b in buckets {
-                    let bid = (b["bucketId"] as? String) ?? ""
-                    let rawGroupName = !dispGroup.isEmpty ? dispGroup : fallbackGroupName(forBucketID: bid)
-                    let winLabel = parseWindowLabel(
-                        windowRaw: b["window"] as? String,
-                        bucketId: bid,
-                        displayName: b["displayName"] as? String
-                    )
-                    // Cloud Code omits remainingFraction in proto3 JSON when 0 remaining (exhausted).
-                    let rem = (b["remainingFraction"] as? NSNumber)?.doubleValue ?? 0.0
-                    let resetTime = b["resetTime"] as? String
-                    grpPools.append(makeQuotaPool(
-                        name: "\(rawGroupName) — \(winLabel)",
-                        groupName: rawGroupName,
-                        windowLabel: winLabel,
-                        rem: rem,
-                        resetTime: resetTime,
-                        models: groupModels,
-                        reportedWindow: true
-                    ))
-                }
-                grpPools.sort { a, b in
-                    let rank: (String?) -> Int = { lbl in
-                        let l = (lbl ?? "").lowercased()
-                        if l.contains("5h") { return 0 }
-                        if l.contains("weekly") { return 1 }
-                        return 2
-                    }
-                    return rank(a.windowLabel) < rank(b.windowLabel)
-                }
-                pools.append(contentsOf: grpPools)
-            }
-        }
-
-        // Check top-level summary buckets (if any standalone bucket is returned outside groups)
-        if let topBuckets = summaryJSON?["buckets"] as? [[String: Any]] {
-            for b in topBuckets {
-                let disp = (b["displayName"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let bid = (b["bucketId"] as? String) ?? ""
-                let rawName = !disp.isEmpty ? disp : fallbackGroupName(forBucketID: bid)
-                let alreadyExists = pools.contains(where: { ($0.groupName ?? $0.name).localizedCaseInsensitiveCompare(rawName) == .orderedSame })
-                if alreadyExists { continue }
+        for grp in groups {
+            let groupName = (grp["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !groupName.isEmpty else { continue }
+            let models = parseGroupModels(description: grp["description"] as? String)
+            var grpPools: [QuotaPool] = []
+            for b in (grp["buckets"] as? [[String: Any]]) ?? [] {
                 let winLabel = parseWindowLabel(
                     windowRaw: b["window"] as? String,
-                    bucketId: bid,
-                    displayName: disp
+                    bucketId: b["id"] as? String,
+                    displayName: b["name"] as? String
                 )
-                let rem = (b["remainingFraction"] as? NSNumber)?.doubleValue ?? 0.0
-                let resetTime = b["resetTime"] as? String
-                pools.append(makeQuotaPool(
-                    name: "\(rawName) — \(winLabel)",
-                    groupName: rawName,
+                let rem: Double
+                if let value = b["remaining_fraction"] {
+                    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                          number.doubleValue.isFinite else { continue }
+                    rem = number.doubleValue
+                } else {
+                    rem = 0 // The CLI omits zero-valued fractions in its JSON.
+                }
+                var resetTime = b["reset_time"] as? String
+                // An unused window reports the Unix epoch; treat that as "no reset scheduled".
+                if let rt = resetTime, let d = parseISODate(rt), d.timeIntervalSince1970 <= 0 {
+                    resetTime = nil
+                }
+                grpPools.append(makeQuotaPool(
+                    name: "\(groupName) — \(winLabel)",
+                    groupName: groupName,
                     windowLabel: winLabel,
                     rem: rem,
                     resetTime: resetTime,
-                    models: nil,
+                    models: models,
                     reportedWindow: true
                 ))
             }
+            grpPools.sort { a, b in
+                let rank: (String?) -> Int = { lbl in
+                    let l = (lbl ?? "").lowercased()
+                    if l.contains("5h") { return 0 }
+                    if l.contains("weekly") { return 1 }
+                    return 2
+                }
+                return rank(a.windowLabel) < rank(b.windowLabel)
+            }
+            pools.append(contentsOf: grpPools)
         }
 
-        // Fallback to fetchAvailableModels only when summary groups/buckets are empty
-        let modelsMap = (modelsData["models"] as? [String: Any]) ?? [:]
-        if pools.isEmpty {
-            var bucketsMap: [String: (rem: Double, resetTime: String?, models: [String])] = [:]
-            for (mID, rawInfo) in modelsMap {
-                guard let mInfo = rawInfo as? [String: Any] else { continue }
-                if (mInfo["isInternal"] as? Bool) == true { continue }
-                guard let quota = mInfo["quotaInfo"] as? [String: Any] else { continue }
+        guard !pools.isEmpty else { return nil }
 
-                let rem = (quota["remainingFraction"] as? NSNumber)?.doubleValue ?? 0.0
-                let resetTime = quota["resetTime"] as? String
-                let disp = (mInfo["displayName"] as? String) ?? mID
-                let idLow = mID.lowercased()
-                let dispLow = disp.lowercased()
-
-                let grp: String
-                if idLow.contains("argon") || dispLow.contains("argon") {
-                    grp = "Gemini 4 Argon"
-                } else if idLow.contains("claude") || dispLow.contains("claude") || idLow.contains("gpt") {
-                    grp = "Claude and GPT models"
-                } else if idLow.contains("gemini") || idLow.contains("flash") || idLow.contains("pro") {
-                    if (idLow.contains("preview") || idLow.contains("tab_")) && rem == 1.0 && (resetTime == nil || resetTime?.isEmpty == true) {
-                        continue
-                    }
-                    grp = "Gemini Models"
-                } else {
-                    grp = "Other Models"
-                }
-
-                if var existing = bucketsMap[grp] {
-                    if rem < existing.rem {
-                        existing.rem = rem
-                        if let rt = resetTime { existing.resetTime = rt }
-                    }
-                    if !existing.models.contains(disp) {
-                        existing.models.append(disp)
-                    }
-                    bucketsMap[grp] = existing
-                } else {
-                    bucketsMap[grp] = (rem, resetTime, [disp])
-                }
-            }
-
-            let orderedGrps = ["Gemini Models", "Claude and GPT models", "Gemini 4 Argon"] + bucketsMap.keys.sorted().filter {
-                $0 != "Gemini Models" && $0 != "Claude and GPT models" && $0 != "Gemini 4 Argon"
-            }
-            for grp in orderedGrps {
-                guard let p = bucketsMap[grp] else { continue }
-                let fmt = formatCountdownAndShort(p.resetTime)
-                let winLabel = (grp == "Gemini 4 Argon" && fmt.secs > 21600) ? "Weekly limit" : "5h limit"
-                pools.append(makeQuotaPool(
-                    name: "\(grp) — \(winLabel)",
-                    groupName: grp,
-                    windowLabel: winLabel,
-                    rem: p.rem,
-                    resetTime: p.resetTime,
-                    models: p.models
-                ))
-            }
-        }
-
-        // Order groups consistently: Gemini Models, Claude and GPT models, Gemini 4 Argon, then others
         let groupRank: (QuotaPool) -> Int = { pool in
             let g = (pool.groupName ?? pool.name).lowercased()
             if g.contains("argon") { return 2 }
@@ -1737,19 +1258,16 @@ enum NativeQuotaFetcher {
             if g.contains("claude") || g.contains("gpt") { return 1 }
             return 3
         }
-        let indexedPools = pools.enumerated().map { ($0.offset, $0.element) }
-        pools = indexedPools.sorted { a, b in
-            let ra = groupRank(a.1)
-            let rb = groupRank(b.1)
-            if ra != rb { return ra < rb }
-            return a.0 < b.0
-        }.map { $0.1 }
+        pools = pools.enumerated().sorted { a, b in
+            let ra = groupRank(a.element), rb = groupRank(b.element)
+            return ra != rb ? ra < rb : a.offset < b.offset
+        }.map(\.element)
 
-        let usage = UsageInfo(email: resolvedEmail, tier: tierName, daily: nil, weekly: nil, pools: pools)
-
+        let tier = savedPlanLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let usage = UsageInfo(email: resolvedEmail, tier: tier, daily: nil, weekly: nil, pools: pools)
         return UsageInfo(
             email: resolvedEmail ?? "Unknown",
-            tier: tierName,
+            tier: tier,
             daily: QuotaHelpers.gemini5hPool(usage),
             weekly: QuotaHelpers.geminiWeeklyPool(usage),
             pools: pools
@@ -1795,133 +1313,86 @@ enum NativeQuotaFetcher {
         return nil
     }
 
+
+    /// Builds the account list. Network work happens only when `checkQuotas` is true
+    /// (the user pressed "Check Quotas"); otherwise the last saved results are shown.
     static func loadStatusPayload(
         store: NativeManifestStore,
-        forceRefresh: Bool,
-        cachedOnly: Bool,
-        includeActiveSession: Bool = true
-    ) async -> StatusPayload {
-        let manifest = store.loadManifest(migrate: !cachedOnly)
-        let currToken = NativeKeychain.getActiveToken(keychainPath: store.keychainPath)
-        var activeKey = store.findActiveAccountKey(manifest: manifest, currentToken: currToken)
-
-        func syncSavedCredential(key: String, from activeToken: String) {
-            guard includeActiveSession, !cachedOnly, let entry = manifest[key] else { return }
+        checkQuotas: Bool,
+        onProgress: (@Sendable (Int, Int) -> Void)? = nil
+    ) async -> (payload: StatusPayload, errors: [String: String], checkedAccounts: Set<String>) {
+        var manifest = store.loadManifest(migrate: true)
+        let initialToken = NativeKeychain.getActiveToken(keychainPath: store.keychainPath)
+        if let initialToken, let key = store.findActiveAccountKey(manifest: manifest, currentToken: initialToken),
+           let entry = manifest[key] {
             let savedToken = store.getAccountToken(entry)
-            guard savedToken != activeToken, tokenExpiry(savedToken) <= tokenExpiry(activeToken) else { return }
-            store.persistRefreshedToken(accountKey: key, newToken: activeToken, replacingSavedToken: savedToken)
-        }
-        if let ak = activeKey, let curr = currToken {
-            syncSavedCredential(key: ak, from: curr)
+            if savedToken != initialToken, tokenExpiry(savedToken) < tokenExpiry(initialToken) {
+                store.persistRefreshedToken(accountKey: key, newToken: initialToken, replacingSavedToken: savedToken)
+            }
         }
 
-        let cachedResult = store.loadUsageCache()
-        let cachedData = cachedResult.data
-        let cacheAge = cachedResult.mtime.map { Date().timeIntervalSince($0) } ?? Double.infinity
-        let allSavedCached = manifest.keys.allSatisfy { cachedData[$0] != nil }
-        let isModernCache = cachedData.values.allSatisfy { u in
-            let ps = u.pools ?? []
-            return !ps.isEmpty && ps.allSatisfy { $0.windowLabel != nil }
-        }
+        var errors: [String: String] = [:]
+        var checkedAccounts: Set<String> = []
 
-        var usedCache = false
-        var usageByKey: [String: UsageInfo] = [:]
-        var unsavedUsage: UsageInfo?
-
-        if cachedOnly {
-            if !cachedData.isEmpty && cacheAge < 86400 && isModernCache {
-                usedCache = true
-                for k in manifest.keys {
-                    if let u = cachedData[k] { usageByKey[k] = u }
+        if checkQuotas {
+            let keys = manifest.keys.sorted()
+            for (idx, key) in keys.enumerated() {
+                if idx > 0 {
+                    try? await Task.sleep(nanoseconds: interAccountDelaySeconds * 1_000_000_000)
                 }
-            }
-        } else if !forceRefresh && !cachedData.isEmpty && cacheAge < 45 && allSavedCached && isModernCache {
-            usedCache = true
-            for k in manifest.keys {
-                if let u = cachedData[k] { usageByKey[k] = u }
-            }
-        } else {
-            var tasks: [(key: String?, token: String, email: String?, planLabel: String)] = []
-            for (k, entry) in manifest {
-                if let tok = store.getAccountToken(entry) {
-                    tasks.append((k, tok, entry.email, entry.planLabel ?? ""))
+                if Task.isCancelled { break }
+                onProgress?(idx + 1, keys.count)
+                guard let entry = manifest[key], let tok = store.getAccountToken(entry) else {
+                    errors[key] = "Saved credential is missing from Keychain."
+                    continue
                 }
-            }
-            if includeActiveSession, let curr = currToken, activeKey == nil {
-                tasks.append((nil, curr, nil, ""))
-            }
-
-            await withTaskGroup(of: (String?, UsageInfo?).self) { group in
-                for item in tasks {
-                    group.addTask {
-                        let usage = await fetchUsage(
-                            tokenStr: item.token,
-                            knownEmail: item.email,
-                            savedPlanLabel: item.planLabel
-                        ) { newTok in
-                            store.persistRefreshedToken(
-                                accountKey: item.key,
-                                newToken: newTok,
-                                replacingSavedToken: item.token
-                            )
+                let result = await runQuotaCheck(
+                    tokenStr: tok,
+                    knownEmail: entry.email,
+                    savedPlanLabel: entry.planLabel
+                )
+                switch result {
+                case .success(let r):
+                    do {
+                        if let recordedKey = try store.recordQuota(key: key, entry: entry, token: tok, usage: r.usage, updatedToken: r.updatedToken) {
+                            checkedAccounts.insert(recordedKey)
+                        } else {
+                            errors[key] = "Saved account changed during the check. Check again."
                         }
-                        return (item.key, usage)
+                    } catch {
+                        errors[key] = "Could not save the quota result."
                     }
+                case .failure(let err):
+                    errors[key] = err.localizedDescription
                 }
-                for await (key, usage) in group {
-                    guard let key else {
-                        unsavedUsage = usage
-                        continue
+                if case .failure(let error) = result, case .cliNotFound = error {
+                    for unchecked in keys.dropFirst(idx + 1) {
+                        errors[unchecked] = error.localizedDescription
                     }
-                    if let u = usage {
-                        usageByKey[key] = u
-                    } else if !forceRefresh, let stale = cachedData[key] {
-                        usageByKey[key] = stale
-                    }
+                    break
                 }
             }
-
-            if !usageByKey.isEmpty {
-                store.saveUsageCache(usageByKey)
-            }
+            manifest = store.loadManifest(migrate: false)
         }
 
-        var activeEmail: String?
-        if let ak = activeKey {
-            if let ue = usageByKey[ak]?.email, ue != "Unknown", !ue.isEmpty {
-                activeEmail = ue
-            } else {
-                activeEmail = manifest[ak]?.email
-            }
-        } else if let curr = currToken {
-            if let ue = unsavedUsage?.email, ue != "Unknown", !ue.isEmpty {
-                activeEmail = ue
-            } else if includeActiveSession && !cachedOnly {
-                activeEmail = await extractEmailFromToken(curr)
-            }
-            if let matchedKey = NativeManifestStore.findAccountKeyByEmail(manifest: manifest, email: activeEmail) {
-                activeKey = matchedKey
-                syncSavedCredential(key: matchedKey, from: curr)
-                if let u = unsavedUsage, usageByKey[matchedKey] == nil {
-                    usageByKey[matchedKey] = u
-                    store.saveUsageCache(usageByKey)
-                }
-            }
-        }
+        let usageByKey = store.loadUsageCache()
+        let currToken = NativeKeychain.getActiveToken(keychainPath: store.keychainPath)
+        let activeKey = store.findActiveAccountKey(manifest: manifest, currentToken: currToken)
+        let activeEmail = activeKey.flatMap { manifest[$0]?.email } ?? currToken.flatMap(emailFromToken)
 
         var accountsOut: [AccountItem] = []
         for k in manifest.keys.sorted() {
             let entry = manifest[k]
             let planLbl = entry?.planLabel?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             var uObj = usageByKey[k]
-            if let u = uObj, !planLbl.isEmpty {
-                uObj = UsageInfo(email: u.email, tier: planLbl, daily: u.daily, weekly: u.weekly, pools: u.pools)
+            if let u = uObj {
+                uObj = UsageInfo(email: u.email, tier: planLbl, daily: u.daily, weekly: u.weekly, pools: u.pools, checkedAt: u.checkedAt)
             }
             let resolvedEmail: String
-            if let ue = uObj?.email, ue != "Unknown", !ue.isEmpty {
-                resolvedEmail = ue
-            } else if let me = entry?.email, !me.isEmpty {
+            if let me = entry?.email, !me.isEmpty {
                 resolvedEmail = me
+            } else if let ue = uObj?.email, ue != "Unknown", !ue.isEmpty {
+                resolvedEmail = ue
             } else {
                 resolvedEmail = k
             }
@@ -1938,7 +1409,7 @@ enum NativeQuotaFetcher {
             ))
         }
 
-        return StatusPayload(
+        let payload = StatusPayload(
             activeKey: activeKey,
             hasActiveSession: currToken != nil,
             activeSessionUnsaved: (currToken != nil && activeKey == nil),
@@ -1946,12 +1417,13 @@ enum NativeQuotaFetcher {
             bestSwitchCandidate: computeBestSwitchCandidate(accounts: accountsOut, activeKey: activeKey),
             accounts: accountsOut,
             fetchedAt: Int(Date().timeIntervalSince1970),
-            fromCache: usedCache
+            fromCache: checkedAccounts.isEmpty
         )
+        return (payload, errors, checkedAccounts)
     }
 }
 
-// MARK: - Official First-Party Antigravity CLI Login (T3 Code Pattern)
+// MARK: - Official First-Party Antigravity CLI Login
 
 enum AddAccountMode: Equatable {
     case agyCli
@@ -1996,7 +1468,11 @@ final class OfficialAgyLoginSession: @unchecked Sendable {
         "AGY_ACP_ENABLE_OAUTH",
         "GEMINI_HOME",
         "AGY_ACP_FORCE_FILE_STORAGE",
+        "AGY_CLI_FORCE_FILE_TOKEN_STORAGE",
         "AGY_CLI_DISABLE_AUTO_UPDATE",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
         "BROWSER",
         "PYTHONUNBUFFERED",
         "ELECTRON_RUN_AS_NODE",
@@ -2054,15 +1530,10 @@ final class OfficialAgyLoginSession: @unchecked Sendable {
                 env[k] = v
             }
         }
-        // Exact environment flags from T3 Code (antigravityAuthSupport.ts):
-        // SSH_CONNECTION + AGY_ACP_FORCE_FILE_STORAGE isolates agy login into acp_token.json
-        // without touching the active Antigravity IDE keychain login.
-        env["SSH_CONNECTION"] = baseEnv["SSH_CONNECTION"] ?? "127.0.0.1 0 127.0.0.1 0"
-        env["GEMINI_HOME"] = profilePath
-        env["AGY_ACP_FORCE_FILE_STORAGE"] = "1"
+        // AGY_CLI_FORCE_FILE_TOKEN_STORAGE is agy's own switch for file-based token storage,
+        // so sign-in lands in the temporary profile and never touches the IDE's Keychain login.
+        env["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"] = "1"
         env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
-        env["PYTHONUNBUFFERED"] = "1"
-        env["ELECTRON_RUN_AS_NODE"] = "1"
         env["TMPDIR"] = tempPath
         return env
     }
@@ -2363,10 +1834,8 @@ final class OfficialAgyLoginSession: @unchecked Sendable {
             return
         }
 
-        Task { [weak self] in
-            let email = await NativeQuotaFetcher.extractEmailFromToken(tok) ?? "antigravity-account"
-            self?.complete(.success((tok, email)))
-        }
+        let email = NativeQuotaFetcher.emailFromToken(tok) ?? "antigravity-account"
+        complete(.success((tok, email)))
     }
 
     private func complete(_ result: Result<(token: String, email: String), Error>) {
@@ -2938,12 +2407,13 @@ enum QuotaHelpers {
     }
 
     static func relativeSyncText(lastUpdated: Date?, isRefreshing: Bool) -> String {
-        if isRefreshing { return "Syncing quotas..." }
-        guard let dt = lastUpdated else { return "Live quotas" }
+        if isRefreshing { return "Checking quotas..." }
+        guard let dt = lastUpdated else { return "Press Check for quotas" }
         let secs = Int(Date().timeIntervalSince(dt))
-        if secs < 15 { return "Updated just now" }
-        if secs < 60 { return "Updated \(secs)s ago" }
-        return "Updated \(secs / 60)m ago"
+        if secs < 60 { return "Checked just now" }
+        if secs < 3600 { return "Checked \(secs / 60)m ago" }
+        if secs < 86400 { return "Checked \(secs / 3600)h ago" }
+        return "Checked \(secs / 86400)d ago"
     }
 }
 
@@ -2980,129 +2450,6 @@ enum DashboardBridge {
     }
 }
 
-// MARK: - 5h Quota Timer Warmup State Store
-
-struct WarmupAccountState: Codable, Sendable {
-    var lastPingAt: Int
-    var trackedResetIso: String?
-    var lastModel: String?
-    var lastAttemptAt: Int? = nil
-}
-
-final class WarmupStateStore: @unchecked Sendable {
-    private let manifestStore: NativeManifestStore
-    let stateURL: URL
-    private let lock = NSLock()
-
-    init(manifestStore: NativeManifestStore) {
-        self.manifestStore = manifestStore
-        self.stateURL = manifestStore.accountsDir.appendingPathComponent("warmup_state.json")
-    }
-
-    func loadAll() -> [String: WarmupAccountState] {
-        lock.lock()
-        defer { lock.unlock() }
-        return _loadUnlocked()
-    }
-
-    private func _loadUnlocked() -> [String: WarmupAccountState] {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: stateURL.path),
-              let data = try? Data(contentsOf: stateURL),
-              let decoded = try? JSONDecoder().decode([String: WarmupAccountState].self, from: data) else {
-            return [:]
-        }
-        return decoded
-    }
-
-    private func _saveUnlocked(_ states: [String: WarmupAccountState]) {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(states) {
-            try? manifestStore.writeSecureFile(url: stateURL, data: data)
-        }
-    }
-
-    func syncTrackedResets(accounts: [AccountItem], now: Date = Date()) {
-        lock.lock()
-        defer { lock.unlock() }
-        var states = _loadUnlocked()
-        var changed = false
-        for acc in accounts {
-            guard let pool = QuotaHelpers.gemini5hPool(acc.usage, requireReportedWindow: true),
-                  let iso = pool.resetIso, !iso.isEmpty,
-                  let resetDt = NativeQuotaFetcher.parseISODate(iso),
-                  resetDt > now else {
-                continue
-            }
-            var entry = states[acc.key] ?? WarmupAccountState(lastPingAt: 0, trackedResetIso: nil, lastModel: nil)
-            if entry.trackedResetIso != iso {
-                entry.trackedResetIso = iso
-                states[acc.key] = entry
-                changed = true
-            }
-        }
-        if changed {
-            _saveUnlocked(states)
-        }
-    }
-
-    func recordWarmupAttempts(keys: [String], at date: Date = Date()) {
-        lock.lock()
-        defer { lock.unlock() }
-        var states = _loadUnlocked()
-        for key in keys {
-            var entry = states[key] ?? WarmupAccountState(lastPingAt: 0, trackedResetIso: nil, lastModel: nil)
-            entry.lastAttemptAt = Int(date.timeIntervalSince1970)
-            states[key] = entry
-        }
-        _saveUnlocked(states)
-    }
-
-    func recordWarmupPing(key: String, modelDisplay: String, at date: Date = Date()) {
-        lock.lock()
-        defer { lock.unlock() }
-        var states = _loadUnlocked()
-        var entry = states[key] ?? WarmupAccountState(lastPingAt: 0, trackedResetIso: nil, lastModel: nil)
-        entry.lastPingAt = Int(date.timeIntervalSince1970)
-        entry.lastModel = modelDisplay
-        if let iso = entry.trackedResetIso,
-           let dt = NativeQuotaFetcher.parseISODate(iso),
-           date >= dt {
-            entry.trackedResetIso = nil
-        }
-        states[key] = entry
-        _saveUnlocked(states)
-    }
-
-    static func shouldCheckQuota(
-        gemini5hPool: QuotaPool?,
-        state: WarmupAccountState?,
-        now: Date = Date()
-    ) -> Bool {
-        let lastPing = Double(state?.lastPingAt ?? 0)
-        let lastAttempt = Double(state?.lastAttemptAt ?? 0)
-        let elapsed = now.timeIntervalSince1970 - max(lastPing, lastAttempt)
-        guard max(lastPing, lastAttempt) == 0 || elapsed >= 300 else { return false }
-
-        let resets = [gemini5hPool?.resetIso, state?.trackedResetIso]
-            .compactMap { $0.flatMap(NativeQuotaFetcher.parseISODate) }
-        if let reset = resets.max() {
-            guard reset <= now else { return false }
-            if lastPing < reset.timeIntervalSince1970 { return true }
-        }
-        guard now.timeIntervalSince1970 - lastPing >= 18_000 else { return false }
-        return quotaIsIdle(gemini5hPool, now: now) || (gemini5hPool == nil && lastPing > 0)
-    }
-
-    static func quotaIsIdle(_ pool: QuotaPool?, now: Date = Date()) -> Bool {
-        guard let pool, pool.remainingPct == 100, pool.usedPct == 0 else { return false }
-        guard let iso = pool.resetIso, !iso.isEmpty else { return true }
-        guard let reset = NativeQuotaFetcher.parseISODate(iso) else { return false }
-        return reset <= now
-    }
-}
-
 // MARK: - Self-Test Runner (Headless & Isolated)
 
 enum NativeSelfTest {
@@ -3112,6 +2459,44 @@ enum NativeSelfTest {
             return false
         }
         return true
+    }
+
+    static func runQuotaProcessTests() async -> Int32 {
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("gravitybar_quota_test_\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: dir) }
+
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let stub = dir.appendingPathComponent("agy")
+            let token = "go-keyring-base64:" + Data(#"{"token":{"access_token":"fixture"}}"#.utf8).base64EncodedString()
+            let response = #"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini","buckets":[{"window":"5h","remaining_fraction":0.5}]}]}}}"#
+
+            func run(_ script: String, timeout: TimeInterval = 5) async throws -> String? {
+                try ("#!/bin/sh\n" + script).write(to: stub, atomically: true, encoding: .utf8)
+                try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stub.path)
+                switch await NativeQuotaFetcher.runQuotaCheck(tokenStr: token, knownEmail: nil, savedPlanLabel: nil, executable: stub.path, timeout: timeout) {
+                case .success(let result):
+                    return result.usage.daily?.remainingPct == 50 ? nil : "Unexpected quota"
+                case .failure(let error):
+                    return error.localizedDescription
+                }
+            }
+
+            let deadlineError = try await run("trap '' TERM\nexec /bin/sleep 2", timeout: 0.1)
+            let unauthorized = try await run("echo 'Authentication required' >&2\necho '\(response)'\nexit 1")
+            let started = ProcessInfo.processInfo.systemUptime
+            let inheritedOutput = try await run("/bin/sleep 3 &\necho '\(response)'")
+            guard check(deadlineError == "The Antigravity CLI timed out.", "quota deadline stops a CLI that ignores TERM"),
+                  check(unauthorized == "Sign-in expired. Add this account again.", "quota rejects success JSON from a failed CLI"),
+                  check(inheritedOutput == nil && ProcessInfo.processInfo.systemUptime - started < 2,
+                        "quota result does not wait for inherited output to close") else { return 1 }
+            print("PASS: native quota CLI execution, timeout, and diagnostics")
+            return 0
+        } catch {
+            fputs("FAIL: Could not run quota process fixtures: \(error)\n", stderr)
+            return 1
+        }
     }
 
     static func runAll() -> Int32 {
@@ -3231,11 +2616,7 @@ enum NativeSelfTest {
         guard check(store.removeAccount(key: "Work Pro").0, "removeAccount") else { return 1 }
         print("PASS: NativeManifestStore migration, CRUD, pin, plan, permissions")
 
-        // 6. Test tier detection & best switch candidate
-        let detected = NativeQuotaFetcher.detectTierName(modelsData: ["userTier": "PRO"], savedPlanLabel: nil)
-        let blankTier = NativeQuotaFetcher.detectTierName(modelsData: [:], savedPlanLabel: nil)
-        guard check(detected == "Antigravity Pro" && blankTier == "", "tier detection") else { return 1 }
-
+        // 6. Test best switch candidate
         let poolLow = QuotaPool(name: "Gemini", usedPct: 90, remainingPct: 10, resetsIn: "1h", resetTime: "10:00", resetShort: "10:00", resetSecs: 3600, resetIso: "", models: nil)
         let poolHigh = QuotaPool(name: "Gemini", usedPct: 10, remainingPct: 90, resetsIn: "1h", resetTime: "10:00", resetShort: "10:00", resetSecs: 3600, resetIso: "", models: nil)
         let accts = [
@@ -3243,66 +2624,57 @@ enum NativeSelfTest {
             AccountItem(key: "B", label: "B", email: "b@x.com", savedAt: "", storage: "keychain", isActive: false, usage: UsageInfo(email: "b@x.com", tier: "", daily: poolHigh, weekly: poolHigh, pools: [poolHigh]))
         ]
         guard check(NativeQuotaFetcher.computeBestSwitchCandidate(accounts: accts, activeKey: "A") == "B", "best switch candidate") else { return 1 }
-        print("PASS: tier detection & best switch candidate")
+        print("PASS: best switch candidate")
 
         // 7. Test MenuBarGaugeRenderer
         let img = MenuBarGaugeRenderer.renderImage(geminiPct: 85.0, claudePct: 15.0)
         guard check(img.size.width == 24 && img.size.height == 18, "gauge image dimensions") else { return 1 }
         print("PASS: MenuBarGaugeRenderer")
 
-        // 8. Test Cloud Code summary parsing (Gemini 5h/Weekly, Claude 5h/Weekly, Gemini 4 Argon, omitted=0)
-        let hubUA = NativeQuotaFetcher.quotaHeaders(version: "2.33.0")["User-Agent"] ?? ""
-        guard check(hubUA.hasPrefix("antigravity/hub/"), "hub User-Agent identity") else { return 1 }
-        let sampleSummary: [String: Any] = [
-            "groups": [
-                [
-                    "displayName": "Gemini Models",
-                    "description": "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash",
-                    "buckets": [
-                        ["bucketId": "gemini-weekly", "window": "weekly", "remainingFraction": 0.79, "resetTime": "2099-01-07T00:00:00Z"],
-                        ["bucketId": "gemini-5h", "window": "5h", "resetTime": "2099-01-01T05:00:00Z"]
-                    ]
-                ],
-                [
-                    "displayName": "Claude and GPT models",
-                    "buckets": [
-                        ["bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1.0],
-                        ["bucketId": "3p-5h", "window": "5h", "remainingFraction": 1.0]
-                    ]
-                ],
-                [
-                    "displayName": "Gemini 4 Argon",
-                    "buckets": [
-                        ["bucketId": "gemini-argon-wtu-weekly", "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "remainingFraction": 0.87, "resetTime": "2099-01-07T22:00:00Z"]
-                    ]
-                ]
-            ]
-        ]
-        guard let parsedUsage = NativeQuotaFetcher.parseUsage(
-            summaryJSON: sampleSummary,
-            modelsJSON: nil,
-            codeAssistJSON: ["paidTier": ["id": "g1-pro-tier", "name": "Google AI Pro"]],
-            resolvedEmail: "user@example.invalid",
-            savedPlanLabel: nil
-        ) else {
-            fputs("FAIL: parseUsage returned nil\n", stderr)
+        // 8. Test parsing of `agy -p /quota --output-format json`
+        let quotaJSON = Data(#"""
+        {"status":"SUCCESS","response":"","command":{"name":"usage","data":{"groups":[
+          {"name":"Gemini Models","description":"Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash","buckets":[
+            {"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.79,"reset_time":"2099-01-07T00:00:00Z"},
+            {"id":"gemini-5h","name":"Five Hour Limit Remaining","window":"5h","reset_time":"2099-01-01T05:00:00Z"}]},
+          {"name":"Claude and GPT models","buckets":[
+            {"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z"},
+            {"id":"3p-5h","name":"Five Hour Limit Remaining","window":"5h","remaining_fraction":1,"reset_time":"1970-01-01T00:00:00Z"}]}]}}}
+        """#.utf8)
+        guard let parsedUsage = NativeQuotaFetcher.parseQuotaJSON(quotaJSON, resolvedEmail: "user@example.invalid", savedPlanLabel: "Pro") else {
+            fputs("FAIL: parseQuotaJSON returned nil\n", stderr)
             return 1
         }
-        guard check(parsedUsage.tier == "Google AI Pro", "paidTier resolved"),
-              check(QuotaHelpers.gemini5hPool(parsedUsage)?.remainingPct == 0.0, "omitted remainingFraction reads as 0.0"),
+        let failedRun = Data(#"{"status":"ERROR","response":"Authentication required"}"#.utf8)
+        guard check(parsedUsage.tier == "Pro", "saved plan label is the tier"),
+              check(QuotaHelpers.gemini5hPool(parsedUsage)?.remainingPct == 0.0, "omitted remaining_fraction reads as 0"),
               check(QuotaHelpers.geminiWeeklyPool(parsedUsage)?.remainingPct == 79.0, "gemini weekly 79%"),
-              check(QuotaHelpers.argonPool(parsedUsage)?.remainingPct == 87.0, "argon weekly 87%"),
-              check(QuotaHelpers.argonPool(parsedUsage)?.windowLabel == "Weekly limit", "argon windowLabel") else { return 1 }
-        print("PASS: Cloud Code hub parsing & Gemini 4 Argon")
+              check(QuotaHelpers.claude5hPool(parsedUsage)?.remainingPct == 100.0, "claude 5h 100%"),
+              check(QuotaHelpers.claude5hPool(parsedUsage)?.resetIso?.isEmpty != false, "epoch reset means no reset scheduled"),
+              check(QuotaHelpers.gemini5hPool(parsedUsage)?.models?.first == "Gemini 4 Hydrogen", "group models parsed"),
+              check(NativeQuotaFetcher.parseQuotaJSON(failedRun, resolvedEmail: nil, savedPlanLabel: nil) == nil, "failed CLI run yields no quota"),
+              check(NativeQuotaFetcher.parseQuotaJSON(Data("not json".utf8), resolvedEmail: nil, savedPlanLabel: nil) == nil, "garbage yields no quota") else { return 1 }
+
+        let qEnv = NativeQuotaFetcher.quotaEnvironment(home: "/tmp/q", shimDir: "/tmp/q/bin", baseEnv: ["SSH_CONNECTION": "x", "GEMINI_API_KEY": "bad", "LANG": "en_US.UTF-8"])
+        let sampleCred = "go-keyring-base64:" + Data(#"{"token":{"access_token":"a","refresh_token":"r"},"id_token_email":"q@example.invalid"}"#.utf8).base64EncodedString()
+        guard check(qEnv["HOME"] == "/tmp/q" && qEnv["BROWSER"] == "/tmp/q/bin/open", "quota run isolates the profile and sets a browser shim"),
+              check(qEnv["PATH"]?.hasPrefix("/tmp/q/bin:") == true, "quota run uses the no-op open shim"),
+              check(qEnv["SSH_CONNECTION"] == nil && qEnv["GEMINI_API_KEY"] == nil && qEnv["LANG"] != nil, "quota run drops unrelated env"),
+              check(qEnv["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"] == "1", "quota run uses agy file token storage"),
+              check(NativeQuotaFetcher.credentialFileData(from: sampleCred) != nil, "stored credential converts to CLI file"),
+              check(NativeQuotaFetcher.credentialFileData(from: "garbage") == nil, "bad credential is rejected"),
+              check(NativeQuotaFetcher.emailFromToken(sampleCred) == "q@example.invalid", "email read locally from credential") else { return 1 }
+        print("PASS: official CLI quota parsing and isolated environment")
 
         // 9. Test OfficialAgyLoginSession isolated env + credential normalization
         let testEnv = OfficialAgyLoginSession.buildIsolatedEnvironment(
-            baseEnv: ["PATH": "/usr/bin", "GEMINI_API_KEY": "bad", "DISPLAY": ":0"],
+            baseEnv: ["PATH": "/usr/bin", "GEMINI_API_KEY": "bad", "DISPLAY": ":0", "SSH_CONNECTION": "1 2 3 4"],
             profilePath: "/tmp/ag_prof",
             tempPath: "/tmp/ag_prof/tmp"
         )
         guard check(testEnv["GEMINI_API_KEY"] == nil && testEnv["DISPLAY"] == nil, "stripped env vars"),
-              check(testEnv["AGY_ACP_FORCE_FILE_STORAGE"] == "1" && testEnv["SSH_CONNECTION"] != nil, "T3 Code agy isolated env") else { return 1 }
+              check(testEnv["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"] == "1", "agy file token storage"),
+              check(testEnv["SSH_CONNECTION"] == nil, "no fake SSH session") else { return 1 }
 
         let flatData = Data("{\"access_token\":\"ya29.test\",\"refresh_token\":\"1//rf\"}".utf8)
         let normFlat = OfficialAgyLoginSession.normalizeCredentialData(flatData, fallbackEmail: "u@example.invalid")
@@ -3310,7 +2682,7 @@ enum NativeSelfTest {
         let normWrap = OfficialAgyLoginSession.normalizeCredentialData(wrapData)
         guard check(normFlat?.hasPrefix("go-keyring-base64:") == true, "normalize flat acp_token.json"),
               check(normWrap?.hasPrefix("go-keyring-base64:") == true, "normalize envelope acp_token.json") else { return 1 }
-        print("PASS: OfficialAgyLoginSession T3 Code isolated env & credential normalization")
+        print("PASS: OfficialAgyLoginSession isolated env & credential normalization")
 
         let cliProfile = tmpRoot.appendingPathComponent("antigravity-acp")
         do {
@@ -3332,97 +2704,32 @@ enum NativeSelfTest {
               check(AppIconRenderer.renderPNGData(pixelSize: 64) != nil, "AppIconRenderer PNG output") else { return 1 }
         print("PASS: AppIconRenderer custom squircle logo")
 
-        // 11. Test 5h Gemini Warmup model selection & window scheduling
-        let withHydrogen: [String: Any] = [
-            "models": [
-                "gemini-3.8-flash-low": ["displayName": "Gemini 3.8 Flash", "quotaInfo": [:]] as [String: Any],
-                "gemini-4-hydrogen": ["displayName": "Gemini 4 Hydrogen", "quotaInfo": [:]] as [String: Any],
-                "claude-opus-5-5": ["displayName": "Claude Opus 5.5", "quotaInfo": [:]] as [String: Any]
-            ]
-        ]
-        let pickH = NativeQuotaFetcher.warmupGeminiModels(from: withHydrogen).map(\.modelId)
-        let withoutHydrogen: [String: Any] = [
-            "models": [
-                "gemini-3.8-flash": ["displayName": "Gemini 3.8 Flash", "quotaInfo": [:]] as [String: Any],
-                "gemini-4-argon": ["displayName": "Gemini 4 Argon", "quotaInfo": [:]] as [String: Any]
-            ]
-        ]
-        let pickF = NativeQuotaFetcher.warmupGeminiModels(from: withoutHydrogen).map(\.modelId)
-        let stream = Data("event: message\r\ndata: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\"}]}}\r\n\r\n".utf8)
-        let generationError = Data("{\"error\":{\"message\":\"Rejected\"}}".utf8)
-        guard check(pickH == ["gemini-4-hydrogen", "gemini-3.8-flash-low"], "warmup prefers Hydrogen then advertised Flash Low"),
-              check(pickF == ["gemini-3.8-flash"], "warmup falls back to 3.8 Flash"),
-              check(NativeQuotaFetcher.warmupGeminiModels(from: [:]).isEmpty, "warmup requires an advertised model"),
-              check(NativeQuotaFetcher.hasWarmupGeneration(stream, streaming: true), "warmup accepts an SSE generation response"),
-              check(!NativeQuotaFetcher.hasWarmupGeneration(generationError, streaming: false), "warmup rejects a 200 error response") else { return 1 }
-
-        let now = Date()
-        let idlePool = QuotaPool(name: "Gemini Models — 5h limit", usedPct: 0.0, remainingPct: 100.0, resetsIn: "N/A", resetTime: "N/A", resetShort: "", resetSecs: 0, resetIso: "", models: nil)
-        let usedPool = QuotaPool(name: "Gemini Models — 5h limit", usedPct: 12.0, remainingPct: 88.0, resetsIn: "3h", resetTime: "18:00", resetShort: "18:00", resetSecs: 10800, resetIso: ISO8601DateFormatter().string(from: now.addingTimeInterval(10800)), models: nil)
-        let pastIso = ISO8601DateFormatter().string(from: now.addingTimeInterval(-60))
-        let pastState = WarmupAccountState(lastPingAt: Int(now.timeIntervalSince1970) - 400, trackedResetIso: pastIso, lastModel: "Gemini 4 Hydrogen")
-        let recentState = WarmupAccountState(lastPingAt: Int(now.timeIntervalSince1970) - 60, trackedResetIso: pastIso, lastModel: "Gemini 4 Hydrogen")
-        guard check(WarmupStateStore.shouldCheckQuota(gemini5hPool: idlePool, state: nil, now: now), "warmup checks idle 100% pool"),
-              check(!WarmupStateStore.shouldCheckQuota(gemini5hPool: usedPool, state: pastState, now: now), "current active window takes precedence over old reset"),
-              check(!WarmupStateStore.shouldCheckQuota(gemini5hPool: idlePool, state: recentState, now: now), "warmup respects success cooldown") else { return 1 }
-        print("PASS: 5h Gemini Warmup model priority & scheduling")
-
-        let futureISO = ISO8601DateFormatter().string(from: now.addingTimeInterval(3600))
-        func fixturePool(group: String, window: String, remaining: Double, reset: String?) -> QuotaPool? {
-            var bucket: [String: Any] = ["window": window, "remainingFraction": remaining]
-            if let reset { bucket["resetTime"] = reset }
-            let groups: [[String: Any]] = group.isEmpty ? [] : [["displayName": group, "buckets": [bucket]]]
-            let usage = NativeQuotaFetcher.parseUsage(
-                summaryJSON: ["groups": groups], modelsJSON: nil, codeAssistJSON: nil,
-                resolvedEmail: nil, savedPlanLabel: nil
-            )
-            return QuotaHelpers.gemini5hPool(usage, requireReportedWindow: true)
-        }
-        let noQuota = fixturePool(group: "", window: "5h", remaining: 1, reset: nil)
-        let weeklyOnly = fixturePool(group: "Gemini Models", window: "weekly", remaining: 1, reset: nil)
-        let claudeOnly = fixturePool(group: "Claude and GPT models", window: "5h", remaining: 1, reset: nil)
-        let futureFull = fixturePool(group: "Gemini Models", window: "5h", remaining: 1, reset: futureISO)
-        let staleExhausted = fixturePool(group: "Gemini Models", window: "5h", remaining: 0, reset: pastIso)
-        let freshIdle = fixturePool(group: "Gemini Models", window: "5h", remaining: 1, reset: nil)
-        let inferredUsage = NativeQuotaFetcher.parseUsage(
-            summaryJSON: nil, modelsJSON: ["models": ["gemini-3.8-flash": ["quotaInfo": ["remainingFraction": 1.0]]]],
-            codeAssistJSON: nil, resolvedEmail: nil, savedPlanLabel: nil
-        )
-        let warmup = WarmupStateStore(manifestStore: store)
-        warmup.recordWarmupAttempts(keys: ["a"], at: now)
-        let afterFailure = WarmupStateStore(manifestStore: store).loadAll()["a"]
-        let schedulerChecks = [
-            check(noQuota == nil, "missing quota cannot schedule a warmup"),
-            check(weeklyOnly == nil, "weekly quota cannot schedule a warmup"),
-            check(claudeOnly == nil, "Claude quota cannot schedule a Gemini warmup"),
-            check(QuotaHelpers.gemini5hPool(inferredUsage, requireReportedWindow: true) == nil, "inferred quota cannot schedule warmup"),
-            check(!WarmupStateStore.shouldCheckQuota(gemini5hPool: futureFull, state: nil, now: now), "future reset takes precedence over 100 percent"),
-            check(WarmupStateStore.shouldCheckQuota(gemini5hPool: staleExhausted, state: pastState, now: now), "expired reset prompts a quota recheck even at cached zero"),
-            check(!WarmupStateStore.quotaIsIdle(staleExhausted, now: now), "exhausted quota cannot send generation after preflight"),
-            check(WarmupStateStore.quotaIsIdle(freshIdle, now: now), "confirmed idle window permits generation"),
-            check(!WarmupStateStore.shouldCheckQuota(gemini5hPool: freshIdle, state: afterFailure, now: now.addingTimeInterval(60)), "failed attempt persists cooldown across restart"),
-            check(WarmupStateStore.shouldCheckQuota(gemini5hPool: freshIdle, state: afterFailure, now: now.addingTimeInterval(300)), "failed attempt can retry after cooldown")
-        ]
+        // 11. Refreshed credentials only replace their own unchanged saved entry
         guard check(NativeKeychain.setActiveToken(t2, keychainPath: kcPath).0, "set second active credential") else { return 1 }
-        guard check(store.saveAccount(token: t1, email: "warmup@example.invalid", customLabel: "Warmup Test").0,
-                    "save warmup test credential") else { return 1 }
+        guard check(store.saveAccount(token: t1, email: "refresh@example.invalid", customLabel: "Refresh Test").0,
+                    "save refresh test credential") else { return 1 }
         let refreshed = "go-keyring-base64:dGVzdF9yZWZyZXNoZWQ="
-        store.persistRefreshedToken(accountKey: "Warmup Test", newToken: refreshed, replacingSavedToken: t1)
-        store.persistRefreshedToken(accountKey: "Warmup Test", newToken: t1, replacingSavedToken: t1)
-        let savedEntry = store.loadManifest(migrate: false)["Warmup Test"]
+        store.persistRefreshedToken(accountKey: "Refresh Test", newToken: refreshed, replacingSavedToken: t1)
+        store.persistRefreshedToken(accountKey: "Refresh Test", newToken: t1, replacingSavedToken: t1)
+        let savedEntry = store.loadManifest(migrate: false)["Refresh Test"]
         let savedToken = savedEntry.flatMap(store.getAccountToken)
-        let savedRefresh = check(savedToken == refreshed && NativeKeychain.getActiveToken(keychainPath: kcPath) == t2,
-                                 "warmup refresh saves only to its own unchanged credential")
-        let duplicateRejected = check(!store.saveAccount(token: t2, email: "other@example.invalid", customLabel: "Warmup Test").0,
-                                      "another account cannot replace a saved label")
-        let empty = NativeQuotaFetcher.parseUsage(
-            summaryJSON: ["groups": []], modelsJSON: nil, codeAssistJSON: nil,
-            resolvedEmail: nil, savedPlanLabel: nil
-        )
-        let unavailable = check(empty != nil && empty?.daily == nil && empty?.weekly == nil && QuotaHelpers.minRemaining(for: empty) < 0,
-                                "empty quota response has no percentage or recommendation score")
-        guard schedulerChecks.allSatisfy({ $0 }), savedRefresh, duplicateRejected, unavailable else { return 1 }
-        print("PASS: Warmup quota guards and active account preservation")
+        guard check(savedToken == refreshed && NativeKeychain.getActiveToken(keychainPath: kcPath) == t2,
+                    "CLI refresh saves only to its own unchanged credential"),
+              check(!store.saveAccount(token: t2, email: "other@example.invalid", customLabel: "Refresh Test").0,
+                    "another account cannot replace a saved label") else { return 1 }
+        print("PASS: credential refresh preserves active account")
+
+        guard let savedEntry else { return 1 }
+        guard check(store.renameAccount(oldKey: "Refresh Test", newKey: "Renamed").0, "rename during quota check") else { return 1 }
+        let recordedKey = try? store.recordQuota(key: "Refresh Test", entry: savedEntry, token: refreshed, usage: parsedUsage, updatedToken: nil)
+        let renamedCache = store.loadUsageCache()
+        guard check(recordedKey == "Renamed" && renamedCache["Renamed"]?.checkedAt != nil && renamedCache["Refresh Test"] == nil,
+                    "quota follows a renamed account and records a timestamp") else { return 1 }
+        guard check(store.removeAccount(key: "Renamed").0, "remove during quota check") else { return 1 }
+        let removedKey = try? store.recordQuota(key: "Refresh Test", entry: savedEntry, token: refreshed, usage: parsedUsage, updatedToken: nil)
+        guard check(removedKey == nil && store.loadUsageCache()["Renamed"] == nil,
+                    "quota cannot recreate a removed cache entry") else { return 1 }
+        print("PASS: quota cache respects concurrent account changes")
 
         // 12. Test FieldEditorShortcut Latin, Persian, and Control+V shortcuts
         let shortcutChecks = [

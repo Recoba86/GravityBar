@@ -10,13 +10,11 @@ import os
 import sys
 import json
 import base64
+import math
 from contextlib import contextmanager
 from functools import wraps
 import fcntl
 import subprocess
-import urllib.error
-import urllib.request
-import urllib.parse
 import time
 import argparse
 import platform
@@ -44,10 +42,6 @@ KEYCHAIN_LEGACY_SAVED_SERVICE = 'antigravity-account-switcher'
 _SAFE_SECRET_ID_RE = re.compile(r'^acct_[a-f0-9]{16,64}$')
 _SAFE_SECURITY_ARG_RE = re.compile(r'^[A-Za-z0-9._:@+/=-]+$')
 
-_CID_CODES = [49, 48, 55, 49, 48, 48, 54, 48, 54, 48, 53, 57, 49, 45, 116, 109, 104, 115, 115, 105, 110, 50, 104, 50, 49, 108, 99, 114, 101, 50, 51, 53, 118, 116, 111, 108, 111, 106, 104, 52, 103, 52, 48, 51, 101, 112, 46, 97, 112, 112, 115, 46, 103, 111, 111, 103, 108, 101, 117, 115, 101, 114, 99, 111, 110, 116, 101, 110, 116, 46, 99, 111, 109]
-_SEC_CODES = [71, 79, 67, 83, 80, 88, 45, 75, 53, 56, 70, 87, 82, 52, 56, 54, 76, 100, 76, 74, 49, 109, 76, 66, 56, 115, 88, 67, 52, 122, 54, 113, 68, 65, 102]
-OAUTH_CLIENT_ID = "".join(chr(x) for x in _CID_CODES)
-OAUTH_CLIENT_SECRET = "".join(chr(x) for x in _SEC_CODES)
 USAGE_DASHBOARD_PATH = os.path.join(ACCOUNTS_DIR, "usage_dashboard.html")
 _account_store_lock = threading.RLock()
 _account_store_local = threading.local()
@@ -388,221 +382,43 @@ def format_countdown(iso_str):
     except Exception:
         return "N/A", "N/A", 0, ""
 
-_DAILY_CLOUDCODE_BASE = "https://daily-cloudcode-pa.googleapis.com"
-_PROD_CLOUDCODE_BASE = "https://cloudcode-pa.googleapis.com"
-_MIN_CLIENT_VERSION = "2.25.0"
-_FALLBACK_CLIENT_VERSION = "2.33.0"
-_NODE_CLIENT_UA = "google-api-nodejs-client/10.3.0"
-_NODE_API_CLIENT = "gl-node/22.21.1"
-_PLACEHOLDER_PROJECT = "aicode-consumers"
+# GravityBar never calls Google's internal APIs, refreshes OAuth tokens itself, or
+# presents itself as another client. Quota comes only from `agy -p /quota`, run by
+# the official Antigravity CLI under its own identity and only when the user asks.
+QUOTA_INTER_ACCOUNT_DELAY_SECS = 6
+QUOTA_TIMEOUT_SECS = 45
 
 
-def _compare_dotted_versions(a, b):
-    def _parts(v):
-        core = str(v).strip().split('-', 1)[0]
-        nums = []
-        for p in core.split('.'):
-            if not p.isdigit():
-                return None
-            nums.append(int(p))
-        return nums if nums else None
-
-    pa, pb = _parts(a), _parts(b)
-    if pa is None:
-        return 0 if pb is None else -1
-    if pb is None:
-        return 1
-    for i in range(max(len(pa), len(pb))):
-        x = pa[i] if i < len(pa) else 0
-        y = pb[i] if i < len(pb) else 0
-        if x != y:
-            return -1 if x < y else 1
-    return 0
-
-
-def _detect_client_version():
-    candidates = [
-        "/Applications/Antigravity.app/Contents/Info.plist",
-        "/Applications/Antigravity IDE.app/Contents/Info.plist",
-        os.path.expanduser("~/Applications/Antigravity.app/Contents/Info.plist"),
-    ]
-    for path in candidates:
-        try:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                m = re.search(r'<key>CFBundleShortVersionString</key>\s*<string>([^<]+)</string>', f.read())
-                if m:
-                    ver = m.group(1).strip()
-                    if ver:
-                        return _MIN_CLIENT_VERSION if _compare_dotted_versions(ver, _MIN_CLIENT_VERSION) < 0 else ver
-        except Exception:
-            continue
-    return _FALLBACK_CLIENT_VERSION
-
-
-def _assist_headers(version):
-    return {
-        'User-Agent': f'antigravity/{version} darwin/arm64 {_NODE_CLIENT_UA}',
-        'x-goog-api-client': _NODE_API_CLIENT,
-    }
-
-
-def _quota_headers(version):
-    return {
-        'User-Agent': f'antigravity/hub/{version} (aidev_client; os_type=darwin; arch=arm64)',
-    }
-
-
-def _resolve_quota_target(code_assist_data):
-    proj = ""
-    if isinstance(code_assist_data, dict):
-        raw_proj = code_assist_data.get('cloudaicompanionProject')
-        if isinstance(raw_proj, str):
-            proj = raw_proj.strip()
-        elif isinstance(raw_proj, dict) and isinstance(raw_proj.get('id'), str):
-            proj = raw_proj['id'].strip()
-    if proj == _PLACEHOLDER_PROJECT:
-        proj = ""
-
-    uses_gcp_tos = False
-    if isinstance(code_assist_data, dict):
-        curr = code_assist_data.get('currentTier')
-        if isinstance(curr, dict):
-            if curr.get('usesGcpTos') is True:
-                uses_gcp_tos = True
-            else:
-                cid = curr.get('id')
-                for t in (code_assist_data.get('allowedTiers') or []):
-                    if isinstance(t, dict) and t.get('id') == cid and t.get('usesGcpTos') is True:
-                        uses_gcp_tos = True
-                        break
-
-    base = _PROD_CLOUDCODE_BASE if (uses_gcp_tos and proj) else _DAILY_CLOUDCODE_BASE
-    body = {'project': proj} if proj else {}
-    return base, body
-
-
-def _has_generation_candidates(body):
-    if not isinstance(body, dict) or 'error' in body:
-        return False
-    response = body.get('response', body)
-    return isinstance(response, dict) and isinstance(response.get('candidates'), list) and bool(response['candidates'])
-
-
-def _parse_generation_stream(body):
-    for event in body.replace('\r\n', '\n').split('\n\n'):
-        data = '\n'.join(line[5:].lstrip(' ') for line in event.splitlines() if line.startswith('data:'))
-        try:
-            parsed = json.loads(data)
-        except ValueError:
-            continue
-        if _has_generation_candidates(parsed):
-            return parsed
-    return None
-
-
-def _post_cloudcode(endpoint, access_token, payload=None, base_url=None, headers=None):
-    """Issue a Cloud Code API POST request and return (status_code, json_dict_or_none)."""
-    base = (base_url or _DAILY_CLOUDCODE_BASE).rstrip('/')
-    body = json.dumps(payload if payload is not None else {}).encode('utf-8')
-    req_headers = {
-        'Authorization': f'Bearer {access_token}',
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'User-Agent': f'antigravity/{_FALLBACK_CLIENT_VERSION} darwin/arm64',
-    }
-    if isinstance(headers, dict):
-        req_headers.update(headers)
-    streaming = endpoint == 'streamGenerateContent?alt=sse'
-    if streaming:
-        req_headers['Accept'] = 'text/event-stream'
-    req = urllib.request.Request(
-        f'{base}/v1internal:{endpoint}',
-        headers=req_headers,
-        data=body
-    )
-    status = -1
+def _parse_iso(iso_str):
+    from datetime import datetime
     try:
-        with urllib.request.urlopen(req, timeout=3.5) as resp:
-            status = getattr(resp, 'status', 200)
-            raw = resp.read().decode('utf-8')
-            return status, _parse_generation_stream(raw) if streaming else json.loads(raw)
-    except urllib.error.HTTPError as e:
-        if e.fp is not None:
-            e.close()
-        return e.code, None
+        return datetime.fromisoformat(str(iso_str).replace('Z', '+00:00'))
     except Exception:
-        return status, None
+        return None
 
-def _detect_tier_name(models_data, saved_plan_label=None, code_assist_data=None):
-    """Resolve user-configured plan label or extract real tier from API response."""
-    if isinstance(saved_plan_label, str) and saved_plan_label.strip():
-        return saved_plan_label.strip()
-    if not isinstance(models_data, dict):
-        models_data = {}
-
-    candidates = []
-    if isinstance(code_assist_data, dict) and code_assist_data.get('paidTier') is not None:
-        candidates.append(code_assist_data.get('paidTier'))
-
-    candidates.extend([
-        models_data.get('userTier'),
-        models_data.get('tier'),
-        models_data.get('plan'),
-        models_data.get('planType'),
-        models_data.get('subscriptionTier'),
-    ])
-    user_status = models_data.get('userStatus')
-    if isinstance(user_status, dict):
-        plan_status = user_status.get('planStatus')
-        if isinstance(plan_status, dict):
-            plan_info = plan_status.get('planInfo')
-            if isinstance(plan_info, dict):
-                candidates.extend([plan_info.get('planName'), plan_info.get('tierName')])
-    if isinstance(code_assist_data, dict) and code_assist_data.get('currentTier') is not None:
-        candidates.append(code_assist_data.get('currentTier'))
-
-    for raw in candidates:
-        val = None
-        if isinstance(raw, dict):
-            val = raw.get('displayName') or raw.get('name') or raw.get('tierName') or raw.get('planName') or raw.get('id')
-        elif isinstance(raw, str):
-            val = raw
-        if isinstance(val, str) and val.strip():
-            upper = val.strip().upper()
-            if upper in ('FREE', 'FREE-TIER', 'FREE_TIER', 'STANDARD', 'STANDARD-TIER', 'DEFAULT'):
-                return 'Free'
-            if upper in ('PRO', 'INDIVIDUAL_PRO', 'GOOGLE_AI_PRO'):
-                return 'Antigravity Pro'
-            if upper in ('G1-PRO-TIER', 'G1_PRO_TIER'):
-                return 'Google AI Pro'
-            if upper in ('ULTRA', 'GOOGLE_AI_ULTRA'):
-                return 'Antigravity Ultra'
-            if upper in ('G1-ULTRA-TIER', 'G1_ULTRA_TIER'):
-                return 'Google AI Ultra'
-            if upper in ('TEAMS', 'ENTERPRISE', 'BUSINESS'):
-                return 'Antigravity Teams'
-            return val.strip()
-    return ""
 
 def _parse_window_label(window_raw=None, bucket_id=None, display_name=None):
-    w = (window_raw or '').lower()
-    bid = (bucket_id or '').lower()
-    disp = (display_name or '').lower()
+    w = window_raw.lower() if isinstance(window_raw, str) else ''
+    bid = bucket_id.lower() if isinstance(bucket_id, str) else ''
+    disp = display_name.lower() if isinstance(display_name, str) else ''
     if w == '5h' or '5h' in bid or 'five hour' in disp or '5-hour' in disp or '5h' in disp:
         return '5h limit'
     if w == 'weekly' or 'weekly' in bid or 'weekly' in disp or '7d' in disp:
         return 'Weekly limit'
-    clean = (display_name or '').strip()
+    clean = display_name.strip() if isinstance(display_name, str) else ''
     return clean if clean else 'Limit'
 
 def _parse_group_models(desc):
-    if not isinstance(desc, str) or 'models within this group:' not in desc.lower():
+    if not isinstance(desc, str):
         return []
-    tail = desc.split(':', 1)[1]
+    marker = re.search(r'models within this group:', desc, re.IGNORECASE)
+    if not marker:
+        return []
+    tail = desc[marker.end():]
     return [x.strip() for x in tail.split(',') if x.strip()]
 
 def _make_quota_pool(name, group_name, window_label, rem_val, reset_time, models=None):
-    rem_val = max(0.0, min(1.0, float(rem_val)))
+    rem_val = max(0.0, min(1.0, rem_val))
     used_pct = round((1.0 - rem_val) * 100, 1)
     rem_pct = round(rem_val * 100, 1)
     countdown, local_reset, secs, iso_dt = format_countdown(reset_time)
@@ -622,417 +438,168 @@ def _make_quota_pool(name, group_name, window_label, rem_val, reset_time, models
         pool['models'] = models
     return pool
 
-def fetch_antigravity_usage(token_str, known_email=None, on_token_refreshed=None, saved_plan_label=None):
-    """Fetch live Antigravity quota and model limits for an account token."""
-    if not token_str or not token_str.startswith('go-keyring-base64:'):
-        return None
+
+def parse_agy_quota_json(raw_text, known_email=None, saved_plan_label=None):
+    """Parse `agy -p /quota --output-format json` into GravityBar's usage shape."""
     try:
-        import datetime
-        import urllib.parse
-        raw_b64 = token_str.split('go-keyring-base64:', 1)[1]
-        data = json.loads(base64.b64decode(raw_b64).decode('utf-8'))
-        t_obj = data.get('token', {})
-        access_token = t_obj.get('access_token')
-        rf = t_obj.get('refresh_token')
-
-        summary_data = None
-        models_data = None
-        code_assist_data = None
-        refreshed_token_str = None
-        client_version = _detect_client_version()
-
-        for attempt in range(2):
-            lca_payload = {
-                'metadata': {
-                    'ideName': 'antigravity',
-                    'ideType': 'ANTIGRAVITY',
-                    'ideVersion': client_version,
-                    'pluginVersion': client_version,
-                    'platform': 'DARWIN_ARM64',
-                    'updateChannel': 'stable',
-                    'pluginType': 'GEMINI',
-                },
-                'mode': 'FULL_ELIGIBILITY_CHECK',
-            }
-            l_status, l_json = _post_cloudcode(
-                'loadCodeAssist',
-                access_token,
-                lca_payload,
-                base_url=_DAILY_CLOUDCODE_BASE,
-                headers=_assist_headers(client_version),
-            )
-            if l_status == 200 and isinstance(l_json, dict):
-                code_assist_data = l_json
-
-            if not (attempt == 0 and l_status == 401):
-                q_base, q_body = _resolve_quota_target(code_assist_data)
-                q_headers = _quota_headers(client_version)
-                s_status, s_json = _post_cloudcode(
-                    'retrieveUserQuotaSummary',
-                    access_token,
-                    q_body,
-                    base_url=q_base,
-                    headers=q_headers,
-                )
-                if s_status == 200 and isinstance(s_json, dict) and ('groups' in s_json or 'buckets' in s_json):
-                    summary_data = s_json
-                m_status, m_json = _post_cloudcode(
-                    'fetchAvailableModels',
-                    access_token,
-                    q_body,
-                    base_url=q_base,
-                    headers=q_headers,
-                )
-                if m_status == 200 and isinstance(m_json, dict) and 'models' in m_json:
-                    models_data = m_json
-
-                if summary_data is not None or models_data is not None:
-                    break
-
-            if attempt == 0 and rf:
-                try:
-                    params = urllib.parse.urlencode({
-                        'client_id': OAUTH_CLIENT_ID,
-                        'client_secret': OAUTH_CLIENT_SECRET,
-                        'grant_type': 'refresh_token',
-                        'refresh_token': rf
-                    }).encode('utf-8')
-                    req_rf = urllib.request.Request('https://oauth2.googleapis.com/token', data=params)
-                    with urllib.request.urlopen(req_rf, timeout=3.5) as r:
-                        tok_d = json.loads(r.read().decode('utf-8'))
-                        new_access = tok_d.get('access_token')
-                        if new_access:
-                            access_token = new_access
-                            if isinstance(t_obj, dict):
-                                t_obj['access_token'] = new_access
-                                expires_in = tok_d.get('expires_in')
-                                if isinstance(expires_in, (int, float)):
-                                    exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=int(expires_in))
-                                    t_obj['expiry'] = exp_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-                                data['token'] = t_obj
-                                refreshed_token_str = 'go-keyring-base64:' + base64.b64encode(
-                                    json.dumps(data, separators=(',', ':')).encode('utf-8')
-                                ).decode('ascii')
-                except Exception:
-                    pass
-            else:
-                return None
-
-        if summary_data is None and models_data is None:
-            return None
-
-        if refreshed_token_str and callable(on_token_refreshed):
-            try:
-                on_token_refreshed(refreshed_token_str)
-            except Exception:
-                pass
-
-        models_data = models_data or {}
-        tier_name = _detect_tier_name(models_data, saved_plan_label=saved_plan_label, code_assist_data=code_assist_data)
-
-        # Extract Email if not provided
-        email = known_email
-        if not email:
-            try:
-                req_u = urllib.request.Request(
-                    'https://www.googleapis.com/oauth2/v3/userinfo',
-                    headers={'Authorization': f'Bearer {access_token}'}
-                )
-                with urllib.request.urlopen(req_u, timeout=2.0) as r:
-                    email = json.loads(r.read().decode('utf-8')).get('email')
-            except Exception:
-                pass
-
-        def _fallback_group_name(bid):
-            low = (bid or '').lower()
-            if 'argon' in low:
-                return 'Gemini 4 Argon'
-            if 'claude' in low or '3p' in low or 'gpt' in low:
-                return 'Claude and GPT models'
-            if 'gemini' in low:
-                return 'Gemini Models'
-            return 'Models'
-
-        pools = []
-        if isinstance(summary_data, dict):
-            for grp in (summary_data.get('groups') or []):
-                if not isinstance(grp, dict):
-                    continue
-                disp_grp = (grp.get('displayName') or '').strip()
-                grp_models = _parse_group_models(grp.get('description'))
-                grp_pools = []
-                for b in (grp.get('buckets') or []):
-                    if not isinstance(b, dict):
-                        continue
-                    bid = b.get('bucketId') or ''
-                    grp_name = disp_grp if disp_grp else _fallback_group_name(bid)
-                    win_lbl = _parse_window_label(b.get('window'), bid, b.get('displayName'))
-                    rem = b.get('remainingFraction')
-                    if rem is None:
-                        rem = 0.0
-                    rt = b.get('resetTime')
-                    grp_pools.append(_make_quota_pool(f"{grp_name} — {win_lbl}", grp_name, win_lbl, rem, rt, grp_models))
-                grp_pools.sort(key=lambda x: 0 if '5h' in x['window_label'].lower() else (1 if 'weekly' in x['window_label'].lower() else 2))
-                pools.extend(grp_pools)
-
-            for b in (summary_data.get('buckets') or []):
-                if not isinstance(b, dict):
-                    continue
-                disp = (b.get('displayName') or '').strip()
-                bid = b.get('bucketId') or ''
-                raw_name = disp if disp else _fallback_group_name(bid)
-                if any((p.get('group_name') or p.get('name')).lower() == raw_name.lower() for p in pools):
-                    continue
-                win_lbl = _parse_window_label(b.get('window'), bid, disp)
-                rem = b.get('remainingFraction')
-                if rem is None:
-                    rem = 0.0
-                pools.append(_make_quota_pool(f"{raw_name} — {win_lbl}", raw_name, win_lbl, rem, b.get('resetTime')))
-
-        models = models_data.get('models', {})
-        if not pools:
-            pools_map = {}
-            for m_id, m_info in models.items():
-                if not isinstance(m_info, dict) or m_info.get('isInternal'):
-                    continue
-                quota = m_info.get('quotaInfo')
-                if not quota:
-                    continue
-                rem = quota.get('remainingFraction')
-                if rem is None:
-                    rem = 0.0
-                reset_time = quota.get('resetTime')
-                disp = m_info.get('displayName') or m_id
-                low_id, low_disp = m_id.lower(), disp.lower()
-
-                if 'argon' in low_id or 'argon' in low_disp:
-                    cat = 'Gemini 4 Argon'
-                elif 'claude' in low_id or 'claude' in low_disp or 'gpt' in low_id:
-                    cat = 'Claude and GPT models'
-                elif 'gemini' in low_id or 'flash' in low_id or 'pro' in low_id:
-                    if ('preview' in low_id or 'tab_' in low_id) and rem == 1.0 and not reset_time:
-                        continue
-                    cat = 'Gemini Models'
-                else:
-                    cat = 'Other Models'
-
-                if cat not in pools_map:
-                    pools_map[cat] = {'rem': rem, 'reset_time': reset_time, 'models': []}
-                else:
-                    if rem < pools_map[cat]['rem']:
-                        pools_map[cat]['rem'] = rem
-                        if reset_time:
-                            pools_map[cat]['reset_time'] = reset_time
-                if disp not in pools_map[cat]['models']:
-                    pools_map[cat]['models'].append(disp)
-
-            ordered_cats = ['Gemini Models', 'Claude and GPT models', 'Gemini 4 Argon'] + [
-                k for k in sorted(pools_map) if k not in ('Gemini Models', 'Claude and GPT models', 'Gemini 4 Argon')
-            ]
-            for cat in ordered_cats:
-                if cat in pools_map:
-                    p = pools_map[cat]
-                    _, _, secs, _ = format_countdown(p['reset_time'])
-                    win_lbl = 'Weekly limit' if (cat == 'Gemini 4 Argon' and secs > 21600) else '5h limit'
-                    pools.append(_make_quota_pool(f"{cat} — {win_lbl}", cat, win_lbl, p['rem'], p['reset_time'], p['models']))
-
-        def _grp_rank(p):
-            g = (p.get('group_name') or p.get('name') or '').lower()
-            if 'argon' in g:
-                return 2
-            if 'gemini' in g:
-                return 0
-            if 'claude' in g or 'gpt' in g:
-                return 1
-            return 3
-        pools.sort(key=_grp_rank)
-
-        gemini = [p for p in pools if 'gemini' in p['group_name'].lower()
-                  and 'argon' not in p['group_name'].lower()]
-        daily = next((p for p in gemini if p['window_label'] == '5h limit'), None)
-        weekly = next((p for p in gemini if p['window_label'] == 'Weekly limit'), None)
-
-        return {
-            'email': email or 'Unknown',
-            'tier': tier_name,
-            'session': daily,
-            'daily': daily,
-            'weekly': weekly,
-            'pools': pools
-        }
+        root = json.loads(raw_text)
     except Exception:
         return None
+    if not isinstance(root, dict) or str(root.get('status', '')).upper() != 'SUCCESS':
+        return None
+    command = root.get('command')
+    if not isinstance(command, dict) or command.get('name') not in ('usage', 'quota'):
+        return None
+    data = command.get('data')
+    groups = data.get('groups') if isinstance(data, dict) else None
+    if not isinstance(groups, list):
+        return None
 
-
-def _extract_raw_project_id(code_assist_data):
-    """Extract raw cloudaicompanionProject identifier from loadCodeAssist response."""
-    if not isinstance(code_assist_data, dict):
-        return ""
-    raw_proj = code_assist_data.get('cloudaicompanionProject')
-    proj = ""
-    if isinstance(raw_proj, str):
-        proj = raw_proj.strip()
-    elif isinstance(raw_proj, dict) and isinstance(raw_proj.get('id'), str):
-        proj = raw_proj['id'].strip()
-    return "" if proj == _PLACEHOLDER_PROJECT else proj
-
-
-def _warmup_gemini_models(models_data):
-    """Keep the first advertised model at each warmup priority."""
-    models_map = models_data.get('models') if isinstance(models_data, dict) else None
-    if not isinstance(models_map, dict):
-        models_map = {}
-    ranked = {}
-    for key in sorted(models_map.keys()):
-        info = models_map.get(key)
-        if not isinstance(info, dict) or info.get('isInternal'):
+    pools = []
+    for grp in groups:
+        if not isinstance(grp, dict):
             continue
-        display = info.get('displayName')
-        disp = (display.strip() if isinstance(display, str) else '') or key
-        name = f"{key} {disp}".lower()
-        if 'gemini' not in name or any(x in name for x in ('argon', 'claude', 'gpt', 'tab_')):
+        name = grp.get('name')
+        grp_name = name.strip() if isinstance(name, str) else ''
+        buckets = grp.get('buckets')
+        if not grp_name or not isinstance(buckets, list):
             continue
-        if 'hydrogen' in name:
-            rank = 0
-        elif 'flash' not in name:
-            continue
-        elif '3.8' in name:
-            rank = 1 if 'low' in name or 'lite' in name else 2
-        else:
-            rank = 3
-        ranked.setdefault(rank, (key, disp))
-    return [ranked[rank] for rank in sorted(ranked)]
-
-
-def select_warmup_gemini_model(models_data):
-    return next(iter(_warmup_gemini_models(models_data)), None)
-
-
-def send_gemini_warmup_ping(token_str, on_token_refreshed=None):
-    """Send a minimal 1-token request to start/warm the account's 5h Gemini quota window."""
-    if not token_str or not token_str.startswith('go-keyring-base64:'):
-        return False, "", "Invalid credential format"
-    try:
-        import datetime
-        raw_b64 = token_str.split('go-keyring-base64:', 1)[1]
-        data = json.loads(base64.b64decode(raw_b64).decode('utf-8'))
-        t_obj = data.get('token', {}) if isinstance(data.get('token'), dict) else {}
-        access_token = t_obj.get('access_token')
-        rf = t_obj.get('refresh_token')
-        if not access_token:
-            return False, "", "Missing access token"
-
-        client_version = _detect_client_version()
-        code_assist_data = None
-        refreshed_token_str = None
-        l_status = -1
-
-        for attempt in range(2):
-            lca_payload = {
-                'metadata': {
-                    'ideName': 'antigravity',
-                    'ideType': 'ANTIGRAVITY',
-                    'ideVersion': client_version,
-                    'pluginVersion': client_version,
-                    'platform': 'DARWIN_ARM64',
-                    'updateChannel': 'stable',
-                    'pluginType': 'GEMINI',
-                },
-                'mode': 'FULL_ELIGIBILITY_CHECK',
-            }
-            l_status, l_json = _post_cloudcode(
-                'loadCodeAssist',
-                access_token,
-                lca_payload,
-                base_url=_DAILY_CLOUDCODE_BASE,
-                headers=_assist_headers(client_version),
-            )
-            if l_status == 401 and attempt == 0 and rf:
-                params = urllib.parse.urlencode({
-                    'client_id': OAUTH_CLIENT_ID,
-                    'client_secret': OAUTH_CLIENT_SECRET,
-                    'grant_type': 'refresh_token',
-                    'refresh_token': rf,
-                }).encode('utf-8')
-                req_rf = urllib.request.Request('https://oauth2.googleapis.com/token', data=params)
-                with urllib.request.urlopen(req_rf, timeout=3.5) as r:
-                    tok_d = json.loads(r.read().decode('utf-8'))
-                    new_access = tok_d.get('access_token')
-                    if new_access:
-                        access_token = new_access
-                        t_obj['access_token'] = new_access
-                        expires_in = tok_d.get('expires_in')
-                        if isinstance(expires_in, (int, float)):
-                            exp_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=int(expires_in))
-                            t_obj['expiry'] = exp_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-                        data['token'] = t_obj
-                        refreshed_token_str = 'go-keyring-base64:' + base64.b64encode(
-                            json.dumps(data, separators=(',', ':')).encode('utf-8')
-                        ).decode('ascii')
+        grp_models = _parse_group_models(grp.get('description'))
+        grp_pools = []
+        for b in buckets:
+            if not isinstance(b, dict):
                 continue
-            if l_status == 200 and isinstance(l_json, dict):
-                code_assist_data = l_json
-            break
+            win_lbl = _parse_window_label(b.get('window'), b.get('id'), b.get('name'))
+            # The CLI omits zero-valued fractions in its JSON.
+            rem = b.get('remaining_fraction', 0.0)
+            if type(rem) not in (int, float) or (isinstance(rem, float) and not math.isfinite(rem)):
+                continue
+            rt = b.get('reset_time')
+            parsed = _parse_iso(rt) if rt else None
+            # An unused window reports the Unix epoch; treat that as "no reset scheduled".
+            if parsed is not None and parsed.timestamp() <= 0:
+                rt = None
+            grp_pools.append(_make_quota_pool(f"{grp_name} — {win_lbl}", grp_name, win_lbl, rem, rt, grp_models))
+        grp_pools.sort(key=lambda x: 0 if '5h' in x['window_label'].lower() else (1 if 'weekly' in x['window_label'].lower() else 2))
+        pools.extend(grp_pools)
 
-        if refreshed_token_str and callable(on_token_refreshed):
-            try:
-                on_token_refreshed(refreshed_token_str)
-            except Exception:
-                pass
-        if code_assist_data is None:
-            return False, "", f"Could not load Cloud Code account (status {l_status})"
+    def _grp_rank(p):
+        g = (p.get('group_name') or p.get('name') or '').lower()
+        if 'argon' in g:
+            return 2
+        if 'gemini' in g:
+            return 0
+        if 'claude' in g or 'gpt' in g:
+            return 1
+        return 3
+    if not pools:
+        return None
+    pools.sort(key=_grp_rank)
 
-        q_base, q_body = _resolve_quota_target(code_assist_data)
-        raw_project = _extract_raw_project_id(code_assist_data)
-        m_status, models_data = _post_cloudcode(
-            'fetchAvailableModels',
-            access_token,
-            q_body,
-            base_url=q_base,
-            headers=_quota_headers(client_version),
+    gemini = [p for p in pools if 'gemini' in p['group_name'].lower() and 'argon' not in p['group_name'].lower()]
+    daily = next((p for p in gemini if p['window_label'] == '5h limit'), None)
+    weekly = next((p for p in gemini if p['window_label'] == 'Weekly limit'), None)
+    tier = saved_plan_label.strip() if isinstance(saved_plan_label, str) else ''
+    return {
+        'email': known_email or 'Unknown',
+        'tier': tier,
+        'session': daily,
+        'daily': daily,
+        'weekly': weekly,
+        'pools': pools,
+    }
+
+
+def _credential_file_text(token_str):
+    """Decode a stored go-keyring-base64 credential into the JSON file agy writes."""
+    if not isinstance(token_str, str) or not token_str.strip().startswith('go-keyring-base64:'):
+        return None
+    try:
+        raw = base64.b64decode(token_str.strip().split('go-keyring-base64:', 1)[1]).decode('utf-8')
+        obj = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get('token'), dict):
+        return None
+    return raw
+
+
+def _agy_quota_env(home_dir, shim_dir, base_env=None):
+    """Sandboxed env: throwaway HOME, agy file token storage, and a no-op `open`."""
+    base_env = os.environ if base_env is None else base_env
+    env = {k: base_env[k] for k in (
+        'LANG', 'LC_ALL', 'LC_CTYPE', 'USER', 'LOGNAME',
+        'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy',
+    ) if k in base_env}
+    env['HOME'] = home_dir
+    env['TMPDIR'] = os.path.join(home_dir, 'tmp')
+    env['PATH'] = shim_dir + ':/usr/bin:/bin:/usr/sbin:/sbin'
+    env['BROWSER'] = os.path.join(shim_dir, 'open')
+    env['AGY_CLI_FORCE_FILE_TOKEN_STORAGE'] = '1'
+    env['AGY_CLI_DISABLE_AUTO_UPDATE'] = '1'
+    return env
+
+
+def fetch_antigravity_usage(token_str, known_email=None, on_token_refreshed=None, saved_plan_label=None):
+    """Check one account's quota with the official CLI. Returns (usage, error)."""
+    agy = find_agy_executable()
+    if not agy:
+        return None, "Official Antigravity CLI (agy) was not found."
+    cred = _credential_file_text(token_str)
+    if cred is None:
+        return None, "Saved credential could not be prepared for the Antigravity CLI."
+    try:
+        with tempfile.TemporaryDirectory(prefix="gravitybar_quota_") as home:
+            return _run_agy_quota(agy, cred, home, known_email, on_token_refreshed, saved_plan_label)
+    except OSError as exc:
+        return None, f"Could not prepare or run the Antigravity CLI: {exc}"
+
+
+def _run_agy_quota(agy, cred, home, known_email, on_token_refreshed, saved_plan_label):
+    shim_dir = os.path.join(home, 'bin')
+    cli_dir = os.path.join(home, '.gemini', 'antigravity-cli')
+    for d in (shim_dir, cli_dir, os.path.join(home, 'tmp')):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    shim = os.path.join(shim_dir, 'open')
+    with open(shim, 'w', encoding='utf-8') as f:
+        f.write('#!/bin/sh\nexit 0\n')
+    os.chmod(shim, 0o700)
+    token_path = os.path.join(cli_dir, 'antigravity-oauth-token')
+    fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(cred)
+    try:
+        proc = subprocess.run(
+            [agy, '-p', '/quota', '--output-format', 'json', '--print-timeout', '30s'],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_agy_quota_env(home, shim_dir),
+            cwd=home,
+            timeout=QUOTA_TIMEOUT_SECS,
         )
-        if m_status != 200:
-            return False, "", f"Could not fetch Cloud Code models (status {m_status})"
-        candidates = _warmup_gemini_models(models_data)
-        if not candidates:
-            return False, "", "No eligible Gemini warmup model was advertised"
+        out = proc.stdout.decode('utf-8', errors='replace')
+    except subprocess.TimeoutExpired:
+        return None, "The Antigravity CLI timed out."
+    except OSError as exc:
+        return None, f"Could not start the Antigravity CLI: {exc}"
 
-        a_headers = _assist_headers(client_version)
-        last_status = -1
-        endpoint = 'generateContent'
+    usage = parse_agy_quota_json(out, known_email=known_email, saved_plan_label=saved_plan_label) if proc.returncode == 0 else None
+    if usage is None:
+        diagnostics = (out + proc.stderr.decode('utf-8', errors='replace')).lower()
+        if 'accounts.google.com' in diagnostics or 'authentication' in diagnostics:
+            return None, "Sign-in expired. Add this account again."
+        return None, "The Antigravity CLI did not report a quota."
 
-        for model_id, disp_name in candidates:
-            payload = {
-                'model': model_id,
-                'request': {
-                    'contents': [{'role': 'user', 'parts': [{'text': 'ok'}]}],
-                    'generationConfig': {
-                        'maxOutputTokens': 1,
-                        'temperature': 0.0,
-                        'thinkingConfig': {'thinkingLevel': 'LOW'},
-                    },
-                },
-            }
-            if raw_project:
-                payload['project'] = raw_project
+    try:
+        with open(token_path, 'r', encoding='utf-8') as f:
+            new_cred = f.read()
+        if new_cred.strip() and new_cred != cred and isinstance(json.loads(new_cred).get('token'), dict) and callable(on_token_refreshed):
+            on_token_refreshed('go-keyring-base64:' + base64.b64encode(new_cred.encode('utf-8')).decode('ascii'))
+    except Exception:
+        pass
+    return usage, None
 
-            status, reply = _post_cloudcode(endpoint, access_token, payload, base_url=q_base, headers=a_headers)
-            if endpoint == 'generateContent' and status in (404, 405, 501):
-                stream_endpoint = 'streamGenerateContent?alt=sse'
-                status, reply = _post_cloudcode(stream_endpoint, access_token, payload, base_url=q_base, headers=a_headers)
-                if status != 404:
-                    endpoint = stream_endpoint
-            last_status = status
-            if status == 200:
-                if _has_generation_candidates(reply):
-                    return True, disp_name, None
-                return False, disp_name, "Cloud Code did not confirm generation"
-            if status not in (400, 404):
-                return False, disp_name, f"Cloud Code returned status {status}"
-
-        return False, candidates[0][1], f"Cloud Code returned status {last_status}"
-    except Exception as e:
-        return False, "", str(e)
 
 def make_ascii_bar(pct, width=20):
     """Generate ASCII progress bar like Claude Code."""
@@ -1091,13 +658,14 @@ def print_claude_cli_usage(usage):
 
     print(f"{CYAN}{BOLD}└─────────────────────────────────────────────────────────────┘{RESET}\n")
 
-def generate_claude_html_dashboard(all_accounts_data, active_key):
+def generate_claude_html_dashboard(all_accounts_data, active_key, errors=None):
     """Generate a pixel-perfect Antigravity styled usage dashboard."""
     ensure_secure_accounts_dir()
     
     # Pre-render JSON payload safely for inline script embedding
     json_data = safe_json_for_script(all_accounts_data)
     active_key_json = safe_json_for_script(active_key or "")
+    check_errors_json = safe_json_for_script(errors or {})
     
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1389,11 +957,13 @@ def generate_claude_html_dashboard(all_accounts_data, active_key):
     <select id="accountSelect"></select>
   </div>
 
+  <p class="stat-reset" id="snapshotTime"></p>
+  <p class="stat-reset" id="checkErrors" role="status" style="white-space:pre-line"></p>
+
   <!-- Gemini 5h Session Card -->
   <div class="card">
     <div class="card-header">
       <div class="card-title">⚡️ Gemini Models — 5h Limit</div>
-      <div class="stat-reset" id="dailyCountdown">⏱ Resets in --</div>
     </div>
     
     <div class="stat-main">
@@ -1412,7 +982,6 @@ def generate_claude_html_dashboard(all_accounts_data, active_key):
   <div class="card">
     <div class="card-header">
       <div class="card-title">🔮 Gemini Models — Weekly Limit</div>
-      <div class="stat-reset" id="weeklyCountdown">⏱ Resets in --</div>
     </div>
     
     <div class="stat-main">
@@ -1440,13 +1009,25 @@ def generate_claude_html_dashboard(all_accounts_data, active_key):
 <script>
   const accountsData = {json_data};
   let activeKey = {active_key_json};
+  const checkErrors = {check_errors_json};
+  document.getElementById("checkErrors").textContent = Object.entries(checkErrors)
+    .map(([account, error]) => account + " — " + error).join("\\n");
   const quotaBarColor = used => used > 85 ? "#E05252" : (used > 60 ? "var(--yellow)" : "var(--accent)");
+  function resetLabel(pool) {{
+    const reset = Date.parse(pool?.reset_iso);
+    if (!Number.isFinite(reset) || reset <= 0) return "";
+    if (reset <= Date.now()) return "Reset time passed. Check quotas again.";
+    return "Scheduled reset " + new Date(reset).toLocaleString();
+  }}
 
   function updateDisplay(accKey) {{
     const data = accountsData[accKey];
     if (!data) return;
 
     document.getElementById("activeEmail").textContent = data.email || accKey;
+    document.getElementById("snapshotTime").textContent = Number.isFinite(data.checked_at)
+      ? "Last checked " + new Date(data.checked_at * 1000).toLocaleString()
+      : "Saved quota snapshot";
     const tierEl = document.getElementById("tierTag");
     if (data.tier) {{
       tierEl.textContent = data.tier;
@@ -1458,14 +1039,12 @@ def generate_claude_html_dashboard(all_accounts_data, active_key):
 
     for (const [prefix, pool] of [["daily", data.daily || data.session], ["weekly", data.weekly]]) {{
         const available = Number.isFinite(pool?.used_pct) && Number.isFinite(pool?.remaining_pct);
-        const hasReset = available && pool.reset_time && pool.reset_time !== "N/A";
         document.getElementById(prefix + "UsedPct").textContent = available ? pool.used_pct + "% used" : "—";
         document.getElementById(prefix + "RemPct").textContent = available ? "(" + pool.remaining_pct + "% remaining)" : "Quota unavailable";
         const fill = document.getElementById(prefix + "ProgressBar");
         fill.style.width = available ? Math.max(0, Math.min(100, pool.used_pct)) + "%" : "0%";
         fill.style.background = available ? quotaBarColor(pool.used_pct) : "";
-        document.getElementById(prefix + "Countdown").textContent = hasReset ? "⏱ Resets in " + pool.resets_in : "";
-        document.getElementById(prefix + "Detail").textContent = hasReset ? "Window refreshes at " + pool.reset_time : "";
+        document.getElementById(prefix + "Detail").textContent = available ? resetLabel(pool) : "";
     }}
 
     // Pools (DOM construction via createElement/textContent)
@@ -1483,9 +1062,7 @@ def generate_claude_html_dashboard(all_accounts_data, active_key):
       const pUsedNum = Number.isFinite(pUsedRaw) ? Math.min(100, Math.max(0, pUsedRaw)) : 0;
       const pUsedDisplay = Number.isFinite(pUsedRaw) ? p.used_pct : 0;
       const pColor = quotaBarColor(pUsedNum);
-      const pReset = (p.resets_in && p.resets_in !== "N/A")
-        ? ("Resets in " + p.resets_in + (p.reset_time && p.reset_time !== "N/A" ? " (" + p.reset_time + ")" : ""))
-        : "Ready to use";
+      const pReset = resetLabel(p);
 
       const headerDiv = document.createElement("div");
       headerDiv.className = "pool-header";
@@ -1592,22 +1169,18 @@ def generate_claude_html_dashboard(all_accounts_data, active_key):
 
 def open_claude_usage_window(target_key=None, force_refresh=False, quiet=False):
     """Fetch usage and open the Claude-style HTML desktop window fast."""
-    payload = get_status_payload(force_refresh=force_refresh, include_unsaved_usage=True)
+    payload = get_status_payload(force_refresh=force_refresh, cached_only=not force_refresh)
     all_data = {account['key']: account['usage'] for account in payload['accounts'] if account['usage']}
     active_key = payload['active_key']
-    if payload['active_session_unsaved'] and payload['unsaved_usage']:
-        active_key = 'Active Session'
-        while active_key in all_data:
-            active_key += ' (unsaved)'
-        all_data[active_key] = payload['unsaved_usage']
 
     if not all_data:
-        _report_error("Usage unavailable", "Could not retrieve Antigravity usage.", quiet=quiet)
+        detail = next(iter((payload.get('errors') or {}).values()), None)
+        _report_error("Usage unavailable", detail or "No quota has been checked yet. Run a quota check first.", quiet=quiet)
         return False
 
     chosen_key = next(key for key in (target_key, active_key, next(iter(all_data))) if key in all_data)
     try:
-        dashboard_path = generate_claude_html_dashboard(all_data, chosen_key)
+        dashboard_path = generate_claude_html_dashboard(all_data, chosen_key, payload.get('errors'))
     except OSError as exc:
         _report_error("Usage unavailable", f"Could not write the quota dashboard: {exc}", quiet=quiet)
         return False
@@ -1888,24 +1461,9 @@ def find_active_account_key(manifest, curr_token):
     return _find_account_key_by_email(manifest, curr_email)
 
 def extract_email_from_token(token_str):
-    """Query Google userinfo API to get email associated with access token."""
-    if not token_str or not token_str.startswith('go-keyring-base64:'):
-        return None
-    try:
-        raw_b64 = token_str.split('go-keyring-base64:', 1)[1]
-        data = json.loads(base64.b64decode(raw_b64).decode('utf-8'))
-        access_token = data.get('token', {}).get('access_token')
-        if access_token:
-            req = urllib.request.Request(
-                'https://www.googleapis.com/oauth2/v3/userinfo',
-                headers={'Authorization': f'Bearer {access_token}'}
-            )
-            with urllib.request.urlopen(req, timeout=2.5) as r:
-                info = json.loads(r.read().decode('utf-8'))
-                return info.get('email')
-    except Exception:
-        pass
-    return None
+    """Read the email the official client stored in the credential. No network call."""
+    email, _ = _extract_token_identity(token_str)
+    return email
 
 def _shred_and_remove_file(file_path):
     """Best-effort overwrite and delete of a validated regular file."""
@@ -2033,20 +1591,27 @@ def _report_error(title, msg, quiet=False):
     else:
         ui_alert(title, msg, is_critical=True)
 
-def _update_usage_cache(mutator_fn):
-    """Safely update usage_cache.json in place if it exists."""
+def _read_usage_cache():
     cache_path = os.path.join(ACCOUNTS_DIR, "usage_cache.json")
-    if not os.path.exists(cache_path):
-        return
     try:
         with open(cache_path, 'r', encoding='utf-8') as f:
             cached = json.load(f)
-        if not isinstance(cached, dict):
-            return
-        if mutator_fn(cached):
-            write_secure_file(cache_path, json.dumps(cached))
-    except Exception:
+        if isinstance(cached, dict):
+            return {key: usage for key, usage in cached.items() if isinstance(usage, dict)}
+    except (OSError, ValueError):
         pass
+    return {}
+
+
+def _update_usage_cache(mutator_fn):
+    """Update the shared cache under the caller's account store transaction."""
+    cached = _read_usage_cache()
+    if mutator_fn(cached):
+        try:
+            write_secure_file(os.path.join(ACCOUNTS_DIR, "usage_cache.json"), json.dumps(cached))
+        except OSError:
+            return False
+    return True
 
 def save_current_account(custom_label=None, quiet=False):
     """Save the currently active OS account securely in OS credential store."""
@@ -2158,6 +1723,28 @@ def _persist_refreshed_token(account_key, previous_token, new_token):
                 save_manifest(manifest)
             except OSError:
                 pass
+
+
+def _record_quota_result(account_key, entry, previous_token, new_token, usage):
+    """Merge one result for the credential that was checked, even after a rename."""
+    with _account_store_transaction():
+        manifest = load_manifest(migrate=False)
+        secret_id = entry.get('secret_id')
+        candidates = [account_key] if not validate_secret_id(secret_id) else [
+            key for key, saved in manifest.items() if isinstance(saved, dict) and saved.get('secret_id') == secret_id
+        ]
+        for key in candidates:
+            current = manifest.get(key)
+            if not current or get_account_token(current) != previous_token:
+                continue
+            def update(cache):
+                cache[key] = dict(usage, checked_at=int(time.time()))
+                return True
+            if not _update_usage_cache(update):
+                raise OSError("Could not save the quota result.")
+            _persist_refreshed_token(key, previous_token, new_token)
+            return True
+        return False
 
 @_serialized_account_change
 def pin_saved_account(account_key, pinned=True):
@@ -2348,120 +1935,73 @@ def _ensure_pool_reset_short(usage_obj):
             p['reset_short'] = format_reset_short(p.get('reset_iso', ''))
     return usage_obj
 
-def get_status_payload(force_refresh=False, cached_only=False, include_unsaved_usage=False):
-    """Return structured JSON-ready account and quota state with zero secrets."""
+def get_status_payload(force_refresh=False, cached_only=False, on_progress=None):
+    """Return JSON-ready account and quota state with zero secrets.
+
+    Quotas are checked over the network only when force_refresh is true (a user-requested
+    check). Accounts are checked one at a time with the official CLI, a few seconds apart.
+    Otherwise the last saved results are returned.
+    """
     manifest = load_manifest(migrate=not cached_only)
+    errors = {}
+    recorded = False
+
+    if force_refresh and not cached_only:
+        keys = sorted(manifest.keys())
+        for idx, k in enumerate(keys):
+            if idx:
+                time.sleep(QUOTA_INTER_ACCOUNT_DELAY_SECS)
+            if callable(on_progress):
+                on_progress(idx + 1, len(keys), k)
+            v = manifest[k] if isinstance(manifest[k], dict) else {}
+            tok = get_account_token(v)
+            if not tok:
+                errors[k] = "Saved credential is missing from the credential store."
+                continue
+            refreshed = []
+            usage, err = fetch_antigravity_usage(
+                tok,
+                known_email=v.get('email'),
+                on_token_refreshed=refreshed.append,
+                saved_plan_label=v.get('plan_label', ''),
+            )
+            if usage:
+                try:
+                    if _record_quota_result(k, v, tok, next(iter(refreshed), None), usage):
+                        recorded = True
+                    else:
+                        errors[k] = "Saved account changed during the check. Check again."
+                except OSError:
+                    errors[k] = "Could not save the quota result."
+            else:
+                errors[k] = err or "Quota check failed."
+                if err and 'was not found' in err:
+                    errors.update(dict.fromkeys(keys[idx + 1:], err))
+                    break
+        manifest = load_manifest(migrate=False)
+
+    usage_by_key = _read_usage_cache()
     curr_token = get_current_keychain_token()
     active_key = find_active_account_key(manifest, curr_token)
-    cache_path = os.path.join(ACCOUNTS_DIR, "usage_cache.json")
-
-    cached_data = {}
-    cache_mtime = 0.0
-    if os.path.exists(cache_path):
-        try:
-            cache_mtime = os.path.getmtime(cache_path)
-            with open(cache_path, 'r', encoding='utf-8') as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                cached_data = loaded
-        except Exception:
-            cached_data = {}
-
-    age = time.time() - cache_mtime if cache_mtime else float('inf')
-    cached_data = {k: u for k, u in cached_data.items() if isinstance(u, dict)}
-    all_saved_cached = all(k in cached_data for k in manifest)
-    used_cache = False
-    usage_by_key = {}
-    unsaved_usage = None
-
-    if cached_only:
-        if cached_data and age < 86400:
-            used_cache = True
-            for k in manifest.keys():
-                if k in cached_data:
-                    usage_by_key[k] = _ensure_pool_reset_short(cached_data[k])
-    else:
-        if not force_refresh and cached_data and age < 45 and all_saved_cached and (active_key or not curr_token):
-            used_cache = True
-            for k in manifest.keys():
-                usage_by_key[k] = _ensure_pool_reset_short(cached_data[k])
-        else:
-            tasks = {}
-            for k, v in manifest.items():
-                if not isinstance(v, dict):
-                    continue
-                tok = get_account_token(v)
-                if tok:
-                    tasks[k] = (tok, v.get('email'), v.get('plan_label', ''))
-
-            if curr_token and not active_key:
-                tasks[None] = (curr_token, None, '')
-
-            if tasks:
-                import concurrent.futures
-                def _fetch_one(item):
-                    name, (tok, email, plan_lbl) = item
-                    def _on_rf(new_tok):
-                        _persist_refreshed_token(name, tok, new_tok)
-                    return name, fetch_antigravity_usage(
-                        tok,
-                        known_email=email,
-                        on_token_refreshed=_on_rf,
-                        saved_plan_label=plan_lbl
-                    )
-
-                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                    for name, u in executor.map(_fetch_one, tasks.items()):
-                        if name is None:
-                            unsaved_usage = _ensure_pool_reset_short(u) if u else None
-                        elif u:
-                            usage_by_key[name] = _ensure_pool_reset_short(u)
-                        elif not force_refresh and name in cached_data:
-                            usage_by_key[name] = _ensure_pool_reset_short(cached_data[name])
-
-            if usage_by_key:
-                try:
-                    write_secure_file(cache_path, json.dumps(usage_by_key))
-                except Exception:
-                    pass
-
     active_email = None
     if active_key:
-        u_act = usage_by_key.get(active_key)
-        if isinstance(u_act, dict) and u_act.get('email') and u_act.get('email') != 'Unknown':
-            active_email = u_act.get('email')
-        elif isinstance(manifest.get(active_key), dict):
+        if isinstance(manifest.get(active_key), dict):
             active_email = manifest[active_key].get('email')
     elif curr_token:
-        if isinstance(unsaved_usage, dict) and unsaved_usage.get('email') and unsaved_usage.get('email') != 'Unknown':
-            active_email = unsaved_usage.get('email')
-        elif not cached_only:
-            active_email = extract_email_from_token(curr_token)
+        active_email = extract_email_from_token(curr_token)
         matched_key = _find_account_key_by_email(manifest, active_email)
         if matched_key:
             active_key = matched_key
-            if isinstance(unsaved_usage, dict) and matched_key not in usage_by_key:
-                usage_by_key[matched_key] = unsaved_usage
-                try:
-                    write_secure_file(cache_path, json.dumps(usage_by_key))
-                except Exception:
-                    pass
 
     accounts_out = []
     for k in sorted(manifest.keys()):
         v = manifest[k] if isinstance(manifest[k], dict) else {}
-        u_obj = usage_by_key.get(k)
+        u_obj = _ensure_pool_reset_short(usage_by_key.get(k))
         plan_lbl = v.get('plan_label', '') if isinstance(v.get('plan_label'), str) else ''
-        if isinstance(u_obj, dict) and plan_lbl.strip():
+        if isinstance(u_obj, dict):
             u_obj = dict(u_obj)
             u_obj['tier'] = plan_lbl.strip()
-        resolved_email = None
-        if isinstance(u_obj, dict) and u_obj.get('email') and u_obj.get('email') != 'Unknown':
-            resolved_email = u_obj.get('email')
-        elif v.get('email'):
-            resolved_email = v.get('email')
-        else:
-            resolved_email = k
+        resolved_email = v.get('email') or (u_obj.get('email') if isinstance(u_obj, dict) and u_obj.get('email') != 'Unknown' else None) or k
 
         accounts_out.append({
             'key': k,
@@ -2476,7 +2016,7 @@ def get_status_payload(force_refresh=False, cached_only=False, include_unsaved_u
         })
 
     return {
-        **({'unsaved_usage': unsaved_usage} if include_unsaved_usage else {}),
+        **({'errors': errors} if errors else {}),
         'active_key': active_key,
         'has_active_session': bool(curr_token),
         'active_session_unsaved': bool(curr_token and not active_key),
@@ -2484,7 +2024,7 @@ def get_status_payload(force_refresh=False, cached_only=False, include_unsaved_u
         'best_switch_candidate': compute_best_switch_candidate(accounts_out, active_key),
         'accounts': accounts_out,
         'fetched_at': int(time.time()),
-        'from_cache': used_cache,
+        'from_cache': not recorded,
     }
 
 def get_antigravity_app_path():
@@ -2621,7 +2161,11 @@ _AGY_STRIPPED_ENV_KEYS = {
     "AGY_ACP_ENABLE_OAUTH",
     "GEMINI_HOME",
     "AGY_ACP_FORCE_FILE_STORAGE",
+    "AGY_CLI_FORCE_FILE_TOKEN_STORAGE",
     "AGY_CLI_DISABLE_AUTO_UPDATE",
+    "SSH_CONNECTION",
+    "SSH_CLIENT",
+    "SSH_TTY",
     "BROWSER",
     "PYTHONUNBUFFERED",
     "ELECTRON_RUN_AS_NODE",
@@ -2647,14 +2191,12 @@ def find_agy_executable():
 
 
 def _build_agy_login_env(base_env, profile_dir, temp_dir):
-    """Build isolated T3 Code compatible environment for `agy acp --login`."""
+    """Build an isolated environment for `agy acp --login`."""
     env = {k: v for k, v in (base_env or {}).items() if k.upper() not in _AGY_STRIPPED_ENV_KEYS}
-    env["SSH_CONNECTION"] = (base_env or {}).get("SSH_CONNECTION") or "127.0.0.1 0 127.0.0.1 0"
-    env["GEMINI_HOME"] = profile_dir
-    env["AGY_ACP_FORCE_FILE_STORAGE"] = "1"
+    # agy's own switch for file-based token storage keeps sign-in inside the temporary
+    # profile, so the IDE's Keychain login is never touched.
+    env["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"] = "1"
     env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "1"
-    env["PYTHONUNBUFFERED"] = "1"
-    env["ELECTRON_RUN_AS_NODE"] = "1"
     env["TMPDIR"] = temp_dir
     return env
 
@@ -2789,7 +2331,7 @@ def add_account_wizard():
     if has_agy:
         mode = ui_confirm(
             "Add New Account",
-            "Choose how to sign in safely with official Google Antigravity:\n\n• Antigravity CLI (Recommended): Uses `agy acp --login` (T3 Code method) without closing Antigravity.\n• Antigravity App: Restarts Antigravity desktop app in login mode.",
+            "Choose how to sign in safely with official Google Antigravity:\n\n• Antigravity CLI (Recommended): Uses `agy acp --login` without closing Antigravity.\n• Antigravity App: Restarts Antigravity desktop app in login mode.",
             buttons=["Cancel", "Antigravity App", "Antigravity CLI"],
             default_idx=3,
             icon="note",
@@ -2907,13 +2449,12 @@ def main_menu():
     manifest = load_manifest()
     curr_token = get_current_keychain_token()
     
-    # Quick live usage fetch for active account
+    # Last checked quota only; quotas are refreshed on request from the usage view.
     active_key = find_active_account_key(manifest, curr_token)
-    active_plan = manifest[active_key].get('plan_label', '') if (active_key and isinstance(manifest.get(active_key), dict)) else ''
-    def _persist_active_rf(new_tok):
-        _persist_refreshed_token(active_key, curr_token, new_tok)
-    active_usage = fetch_antigravity_usage(curr_token, on_token_refreshed=_persist_active_rf, saved_plan_label=active_plan) if curr_token else None
-    active_email = active_usage.get('email') if active_usage else (extract_email_from_token(curr_token) if curr_token else None)
+    cached = get_status_payload(cached_only=True)
+    active_usage = next((a['usage'] for a in cached['accounts'] if a['key'] == active_key), None)
+    active_email = (manifest[active_key].get('email') if active_key and isinstance(manifest.get(active_key), dict) else None) \
+        or (extract_email_from_token(curr_token) if curr_token else None)
 
     items = []
     for k in sorted(manifest.keys()):
@@ -2934,7 +2475,8 @@ def main_menu():
         if r_in != 'N/A':
             usage_info_line += f" (Resets: {r_in})"
             
-    items.append("📊 View Usage & Limits (Claude Style)")
+    items.append("📊 View Last Checked Quotas")
+    items.append("🔄 Check All Quotas Now")
     items.append(f"💾 Save Current Account ({curr_display})")
     items.append("➕ Add New Account (Guided Wizard)")
     if manifest:
@@ -2955,8 +2497,10 @@ def main_menu():
     elif choice.startswith("🟢 [ACTIVE] "):
         play_sound("Tink")
         ui_alert("Active Account", "This account is already active!")
-    elif choice == "📊 View Usage & Limits (Claude Style)":
+    elif choice == "📊 View Last Checked Quotas":
         open_claude_usage_window(active_key)
+    elif choice == "🔄 Check All Quotas Now":
+        open_claude_usage_window(active_key, force_refresh=True)
     elif choice.startswith("💾 Save Current Account"):
         save_current_account()
     elif choice.startswith("➕ Add New Account") or choice.startswith("➕ Add New Gmail"):
@@ -2974,8 +2518,8 @@ if __name__ == '__main__':
     parser.add_argument('-u', '--usage', action='store_true', help="Display Antigravity usage in Claude Code CLI style")
     parser.add_argument('--usage-gui', action='store_true', help="Open interactive Claude-style desktop usage dashboard")
     parser.add_argument('--status-json', action='store_true', help="Print accounts and quota status as JSON")
-    parser.add_argument('--force-refresh', action='store_true', help="Bypass quota cache when fetching usage")
-    parser.add_argument('--cached-only', action='store_true', help="Return cached quota status without network calls")
+    parser.add_argument('--force-refresh', action='store_true', help="Check every saved account's quota now with the official agy CLI")
+    parser.add_argument('--cached-only', action='store_true', help="Return last checked quota status without running agy")
     parser.add_argument('--quiet', action='store_true', help="Suppress GUI alerts, banners, and sounds")
     parser.add_argument('--list', action='store_true', help="List saved accounts")
     parser.add_argument('--switch', type=str, help="Switch to specific account")
@@ -2992,31 +2536,9 @@ if __name__ == '__main__':
     parser.add_argument('--github', action='store_true', help="Open GitHub project page")
     parser.add_argument('--about', action='store_true', help="Display creator & project info")
     parser.add_argument('--get-token', action='store_true', help="Print currently active token to stdout")
-    parser.add_argument('--warmup-5h', action='store_true', help="Send 1-token warmup ping to start 5h Gemini quota timers across saved accounts")
     args = parser.parse_args()
 
-    if args.warmup_5h:
-        m = load_manifest()
-        any_ok = False
-        if m:
-            for k, entry in sorted(m.items()):
-                tok = get_account_token(entry) if isinstance(entry, dict) else None
-                if not tok:
-                    continue
-                ok, mdl, err = send_gemini_warmup_ping(
-                    tok,
-                    on_token_refreshed=lambda nt, key=k, previous=tok: _persist_refreshed_token(key, previous, nt),
-                )
-                any_ok = any_ok or ok
-                print(f"{'✓' if ok else '❌'} {k}: {mdl if ok else err}")
-        else:
-            curr = get_current_keychain_token()
-            if curr:
-                ok, mdl, err = send_gemini_warmup_ping(curr)
-                any_ok = ok
-                print(f"{'✓' if ok else '❌'} active: {mdl if ok else err}")
-        sys.exit(0 if any_ok else 1)
-    elif args.get_token:
+    if args.get_token:
         curr = get_current_keychain_token()
         if curr:
             print(curr)
@@ -3031,12 +2553,14 @@ if __name__ == '__main__':
             sys.exit(1)
         m = load_manifest()
         active_k = find_active_account_key(m, curr)
-        plan_lbl = m[active_k].get('plan_label', '') if (active_k and isinstance(m.get(active_k), dict)) else ''
-        usage = fetch_antigravity_usage(
+        entry = m.get(active_k) if active_k and isinstance(m.get(active_k), dict) else {}
+        usage, err = fetch_antigravity_usage(
             curr,
-            on_token_refreshed=lambda nt: _persist_refreshed_token(active_k, curr, nt),
-            saved_plan_label=plan_lbl
+            known_email=entry.get('email') or extract_email_from_token(curr),
+            saved_plan_label=entry.get('plan_label', ''),
         )
+        if err:
+            print(f"\n❌ {err}\n")
         print_claude_cli_usage(usage)
         if not usage or not (usage.get('pools') or usage.get('daily') or usage.get('weekly')):
             sys.exit(1)

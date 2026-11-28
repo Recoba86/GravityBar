@@ -26,18 +26,16 @@ def make_fake_token(access_tok="ya29.initial", refresh_tok="1//refresh_abc"):
     return "go-keyring-base64:" + base64.b64encode(payload).decode("ascii")
 
 
-class FakeHTTPResponse:
-    def __init__(self, body_dict):
-        self._data = json.dumps(body_dict).encode("utf-8")
-
-    def read(self):
-        return self._data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+AGY_QUOTA_SAMPLE = {
+    "conversation_id": "", "status": "SUCCESS", "response": "",
+    "command": {"name": "usage", "data": {"groups": [
+        {"name": "Gemini Models", "description": "Models within this group: Gemini 4 Hydrogen, Gemini 3.8 Flash", "buckets": [
+            {"id": "gemini-weekly", "name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 0.56, "reset_time": "2099-12-03T12:58:36Z"},
+            {"id": "gemini-5h", "name": "Five Hour Limit Remaining", "window": "5h", "remaining_fraction": 0.58, "reset_time": "2099-11-28T16:24:52Z"}]},
+        {"name": "Claude and GPT models", "buckets": [
+            {"id": "3p-weekly", "name": "Weekly Limit Remaining", "window": "weekly", "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"},
+            {"id": "3p-5h", "name": "Five Hour Limit Remaining", "window": "5h", "remaining_fraction": 1, "reset_time": "1970-01-01T00:00:00Z"}]}]}},
+}
 
 
 class SwitcherCoreTestSuite(unittest.TestCase):
@@ -166,7 +164,7 @@ class SwitcherCoreTestSuite(unittest.TestCase):
                 "pools": [{"name": "<img src=x onerror=alert(9)>", "used_pct": 30, "resets_in": "2h", "reset_time": "Today"}],
             }
         }
-        path = sc.generate_claude_html_dashboard(data, evil_key)
+        path = sc.generate_claude_html_dashboard(data, evil_key, {evil_key: xss})
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         with open(path, "r", encoding="utf-8") as f:
             html = f.read()
@@ -174,59 +172,148 @@ class SwitcherCoreTestSuite(unittest.TestCase):
         self.assertIn("prefers-color-scheme: light", html)
         self.assertNotIn("218, 119, 86", html)
         self.assertNotIn("innerHTML", html)
+        self.assertIn('getElementById("checkErrors").textContent', html)
+        self.assertIn("Reset time passed. Check quotas again.", html)
         script_body = html.split("<script>", 1)[1].rsplit("</script>", 1)[0]
         self.assertNotIn("</script>", script_body)
         self.assertIn("\\u003c/script\\u003e", script_body)
 
-    def test_detect_tier_name(self):
-        self.assertEqual(sc._detect_tier_name({}, saved_plan_label="Custom Team"), "Custom Team")
-        self.assertEqual(sc._detect_tier_name({"userTier": "PRO"}), "Antigravity Pro")
-        self.assertEqual(sc._detect_tier_name({"userTier": {"displayName": "Antigravity Ultra"}}), "Antigravity Ultra")
-        self.assertEqual(sc._detect_tier_name({}), "")
-
-    def test_quota_refresh_preserves_new_active_session_and_manifest_changes(self):
+    def test_quota_check_uses_official_cli_and_preserves_new_active_session(self):
         tok_old = make_fake_token("ya29.expired", "1//my_refresh")
         tok_other = make_fake_token("ya29.other", "1//other")
         self.store[(sc.KEYCHAIN_ACTIVE_SERVICE, sc.KEYCHAIN_ACTIVE_ACCOUNT)] = tok_old
-
         with patch.object(sc, "extract_email_from_token", return_value="user1@example.invalid"):
             self.assertTrue(sc.save_current_account(custom_label="Work", quiet=True))
 
-        calls = []
+        program = Path(self.tmpdir) / "agy"
+        log = Path(self.tmpdir) / "agy.log"
+        program.write_text(
+            "#!/usr/bin/python3\n"
+            "import json, os, sys\n"
+            f"open({str(log)!r}, 'a').write(json.dumps({{'argv': sys.argv[1:], 'home': os.environ['HOME'], "
+            "'browser': os.environ.get('BROWSER'), 'ssh': os.environ.get('SSH_CONNECTION'), "
+            "'storage': os.environ.get('AGY_CLI_FORCE_FILE_TOKEN_STORAGE')}) + '\\n')\n"
+            "p = os.path.join(os.environ['HOME'], '.gemini/antigravity-cli/antigravity-oauth-token')\n"
+            "cred = json.load(open(p))\n"
+            "cred['token']['access_token'] = 'ya29.fresh_token'\n"
+            "json.dump(cred, open(p, 'w'))\n"
+            + "print(json.dumps(" + repr(AGY_QUOTA_SAMPLE) + "))\n"
+        )
+        program.chmod(0o700)
 
-        def fake_urlopen(req, timeout=3.5):
-            calls.append(req.full_url)
-            if "daily-cloudcode-pa.googleapis.com" in req.full_url:
-                auth = req.headers.get("Authorization") or req.headers.get("authorization")
-                if auth == "Bearer ya29.expired":
-                    raise RuntimeError("401 Unauthorized")
-                return FakeHTTPResponse({
-                    "userTier": "PRO",
-                    "models": {
-                        "gemini-3-pro": {"displayName": "Gemini 3 Pro", "quotaInfo": {"remainingFraction": 0.85, "resetTime": "2099-01-01T12:00:00Z"}},
-                        "claude-4-6-sonnet": {"displayName": "Claude 4.6 Sonnet", "quotaInfo": {"remainingFraction": 0.60, "resetTime": "2099-01-05T12:00:00Z"}},
-                    },
-                })
-            if "oauth2.googleapis.com/token" in req.full_url:
-                self.store[(sc.KEYCHAIN_ACTIVE_SERVICE, sc.KEYCHAIN_ACTIVE_ACCOUNT)] = tok_other
-                self.assertTrue(sc.pin_saved_account("Work"))
-                return FakeHTTPResponse({"access_token": "ya29.fresh_token", "expires_in": 3600})
-            raise AssertionError(f"Unexpected URL: {req.full_url}")
+        def changed_while_running(*_a):
+            self.store[(sc.KEYCHAIN_ACTIVE_SERVICE, sc.KEYCHAIN_ACTIVE_ACCOUNT)] = tok_other
+            self.assertTrue(sc.pin_saved_account("Work"))
 
-        with patch.object(sc.urllib.request, "urlopen", side_effect=fake_urlopen):
-            payload = sc.get_status_payload(force_refresh=True, cached_only=False)
+        with patch.object(sc, "find_agy_executable", return_value=str(program)), \
+             patch("socket.socket.connect", side_effect=AssertionError("GravityBar made a network call")):
+            payload = sc.get_status_payload(force_refresh=True, on_progress=changed_while_running)
 
-        self.assertEqual(payload["accounts"][0]["usage"]["tier"], "Antigravity Pro")
+        run = json.loads(log.read_text().splitlines()[0])
+        self.assertEqual(run["argv"], ["-p", "/quota", "--output-format", "json", "--print-timeout", "30s"])
+        self.assertIsNone(payload["active_key"])
+        self.assertTrue(run["browser"].endswith("/bin/open"))
+        self.assertIsNone(run["ssh"])
+        self.assertEqual(run["storage"], "1")
+        self.assertFalse(os.path.exists(run["home"]))
+
+        usage = payload["accounts"][0]["usage"]
+        self.assertAlmostEqual(usage["daily"]["remaining_pct"], 58.0)
+        self.assertFalse(payload["from_cache"])
         m = sc.load_manifest(migrate=False)
-        sid = m["Work"]["secret_id"]
-        saved_tok = self.store[(sc.KEYCHAIN_SAVED_SERVICE, sid)]
-        active_tok = self.store[(sc.KEYCHAIN_ACTIVE_SERVICE, sc.KEYCHAIN_ACTIVE_ACCOUNT)]
-        self.assertNotEqual(saved_tok, tok_old)
-        self.assertEqual(active_tok, tok_other)
+        saved_tok = self.store[(sc.KEYCHAIN_SAVED_SERVICE, m["Work"]["secret_id"])]
+        self.assertEqual(self.store[(sc.KEYCHAIN_ACTIVE_SERVICE, sc.KEYCHAIN_ACTIVE_ACCOUNT)], tok_other)
         self.assertTrue(m["Work"]["pinned"])
         decoded = json.loads(base64.b64decode(saved_tok.split("go-keyring-base64:", 1)[1]).decode("utf-8"))
         self.assertEqual(decoded["token"]["access_token"], "ya29.fresh_token")
         self.assertEqual(m["Work"]["token_sha256"], sc.compute_token_sha256(saved_tok))
+
+        cached = sc.get_status_payload(cached_only=True)
+        self.assertTrue(cached["from_cache"])
+        self.assertAlmostEqual(cached["accounts"][0]["usage"]["daily"]["remaining_pct"], 58.0)
+
+    def test_quota_check_spaces_accounts_and_reports_errors(self):
+        for label, rf in (("A", "1//a"), ("B", "1//b")):
+            self.store[(sc.KEYCHAIN_ACTIVE_SERVICE, sc.KEYCHAIN_ACTIVE_ACCOUNT)] = make_fake_token("ya29." + label, rf)
+            with patch.object(sc, "extract_email_from_token", return_value=f"{label.lower()}@example.invalid"):
+                self.assertTrue(sc.save_current_account(custom_label=label, quiet=True))
+        sleeps = []
+        results = iter([(None, "Sign-in expired. Add this account again."), ({"pools": [], "daily": None, "weekly": None}, None)])
+        with patch.object(sc, "fetch_antigravity_usage", side_effect=lambda *a, **k: next(results)), \
+             patch.object(sc.time, "sleep", side_effect=sleeps.append):
+            payload = sc.get_status_payload(force_refresh=True)
+        self.assertEqual(sleeps, [sc.QUOTA_INTER_ACCOUNT_DELAY_SECS])
+        self.assertGreaterEqual(sc.QUOTA_INTER_ACCOUNT_DELAY_SECS, 5)
+        self.assertEqual(payload["errors"], {"A": "Sign-in expired. Add this account again."})
+
+        with patch.object(sc, "fetch_antigravity_usage", side_effect=AssertionError("must not run agy")):
+            sc.get_status_payload()
+            sc.get_status_payload(cached_only=True)
+
+    def test_parse_agy_quota_json(self):
+        usage = sc.parse_agy_quota_json(json.dumps(AGY_QUOTA_SAMPLE), known_email="u@example.invalid", saved_plan_label="Pro")
+        self.assertEqual(usage["tier"], "Pro")
+        self.assertAlmostEqual(usage["daily"]["remaining_pct"], 58.0)
+        self.assertAlmostEqual(usage["weekly"]["remaining_pct"], 56.0)
+        claude = [p for p in usage["pools"] if p["group_name"] == "Claude and GPT models"]
+        self.assertEqual([p["window_label"] for p in claude], ["5h limit", "Weekly limit"])
+        self.assertTrue(all(p["remaining_pct"] == 100.0 and p["resets_in"] == "N/A" for p in claude))
+        self.assertIn("Gemini 4 Hydrogen", usage["daily"]["models"])
+        self.assertIsNone(sc.parse_agy_quota_json('{"status":"ERROR"}'))
+        self.assertIsNone(sc.parse_agy_quota_json("Authentication required"))
+        for groups in ([], [{"name": "Gemini", "buckets": []}], [{"name": 123, "buckets": 123}]):
+            response = {"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": groups}}}
+            self.assertIsNone(sc.parse_agy_quota_json(json.dumps(response)))
+
+    def test_quota_failure_preserves_last_successful_snapshot(self):
+        token = make_fake_token()
+        self.assertTrue(sc._save_token_directly(token, "work@example.invalid", "Work")[0])
+        usage = sc.parse_agy_quota_json(json.dumps(AGY_QUOTA_SAMPLE))
+        with patch.object(sc, "fetch_antigravity_usage", return_value=(usage, None)):
+            successful = sc.get_status_payload(force_refresh=True)
+        cache = Path(sc.ACCOUNTS_DIR) / "usage_cache.json"
+        timestamp = cache.stat().st_mtime_ns
+        with patch.object(sc, "fetch_antigravity_usage", return_value=(None, "Sign-in expired.")):
+            failed = sc.get_status_payload(force_refresh=True)
+        self.assertTrue(failed["from_cache"])
+        self.assertEqual(failed["accounts"][0]["usage"], successful["accounts"][0]["usage"])
+        self.assertEqual(cache.stat().st_mtime_ns, timestamp)
+        self.assertIn("checked_at", failed["accounts"][0]["usage"])
+
+    def test_quota_result_follows_account_renamed_during_check(self):
+        self.assertTrue(sc._save_token_directly(make_fake_token(), "work@example.invalid", "Work")[0])
+
+        def finish_after_rename(*args, **kwargs):
+            self.assertTrue(sc.rename_saved_account("Work", "Renamed"))
+            return sc.parse_agy_quota_json(json.dumps(AGY_QUOTA_SAMPLE)), None
+
+        with patch.object(sc, "fetch_antigravity_usage", side_effect=finish_after_rename):
+            payload = sc.get_status_payload(force_refresh=True)
+        self.assertEqual([a["key"] for a in payload["accounts"]], ["Renamed"])
+        cache = json.loads((Path(sc.ACCOUNTS_DIR) / "usage_cache.json").read_text())
+        self.assertEqual(set(cache), {"Renamed"})
+
+    def test_quota_cli_uses_exit_status_and_stderr(self):
+        program = Path(self.tmpdir) / "agy"
+        program.write_text(
+            "#!/usr/bin/python3\nimport sys\n"
+            "print('Authentication required', file=sys.stderr)\n"
+            f"print({json.dumps(AGY_QUOTA_SAMPLE)!r})\n"
+            "sys.exit(1)\n"
+        )
+        program.chmod(0o700)
+        with patch.object(sc, "find_agy_executable", return_value=str(program)):
+            self.assertEqual(sc.fetch_antigravity_usage(make_fake_token()), (None, "Sign-in expired. Add this account again."))
+
+    def test_no_internal_google_api_or_borrowed_oauth_client(self):
+        paths = [Path(sc.__file__), Path(REPO_ROOT) / "editor-extension/extension.js"]
+        paths.extend((Path(REPO_ROOT) / "menubar-app").glob("*.swift"))
+        for path in paths:
+            with self.subTest(path=path):
+                source = path.read_text(encoding="utf-8").lower()
+                for banned in ("cloudcode-pa", "v1internal", "oauth2.googleapis.com", "googleapis.com/oauth2",
+                               "client_secret", "antigravity/hub", "retrieveuserquotasummary", "fetchavailablemodels"):
+                    self.assertNotIn(banned, source)
 
     def test_failed_remove_preserves_saved_credential(self):
         token = make_fake_token()
@@ -295,23 +382,16 @@ class SwitcherCoreTestSuite(unittest.TestCase):
         self.assertEqual(sc.get_account_token(sc.load_manifest(migrate=False)["Work"]), original)
 
     def test_missing_quota_windows_are_not_reported_as_full(self):
-        weekly = {"groups": [{
-            "displayName": "Gemini Models",
-            "buckets": [{"window": "weekly", "remainingFraction": 0.42}],
-        }]}
-        for summary, weekly_remaining in (({"groups": []}, None), (weekly, 42)):
-            with self.subTest(summary=summary):
-                def post(method, *_args, **_kwargs):
-                    return 200, summary if method == "retrieveUserQuotaSummary" else {}
-
-                with patch.object(sc, "_post_cloudcode", side_effect=post):
-                    usage = sc.fetch_antigravity_usage(make_fake_token(), known_email="work@example.invalid")
-                self.assertIsNone(usage["daily"])
-                self.assertEqual(usage["weekly"] and usage["weekly"]["remaining_pct"], weekly_remaining)
-                output = io.StringIO()
-                with patch("sys.stdout", output):
-                    sc.print_claude_cli_usage(usage)
-                self.assertIn("Quota unavailable", output.getvalue())
+        def sample(groups):
+            return json.dumps({"status": "SUCCESS", "command": {"name": "usage", "data": {"groups": groups}}})
+        weekly = [{"name": "Gemini Models", "buckets": [{"window": "weekly", "remaining_fraction": 0.42}]}]
+        usage = sc.parse_agy_quota_json(sample(weekly), known_email="work@example.invalid")
+        self.assertIsNone(usage["daily"])
+        self.assertEqual(usage["weekly"]["remaining_pct"], 42)
+        output = io.StringIO()
+        with patch("sys.stdout", output):
+            sc.print_claude_cli_usage(usage)
+        self.assertIn("Quota unavailable", output.getvalue())
 
     def test_official_login_times_out_when_cli_never_prints_a_url(self):
         program = os.path.join(self.tmpdir, "agy")
@@ -342,10 +422,10 @@ class SwitcherCoreTestSuite(unittest.TestCase):
             with self.subTest(filename=filename):
                 program.write_text(
                     "#!/usr/bin/python3\n"
-                    "import os\nfrom pathlib import Path\n"
+                    "import os, sys\nfrom pathlib import Path\n"
                     "print('https://accounts.google.com/fixture', flush=True)\n"
                     "if input() == 'test-code':\n"
-                    f"    p = Path(os.environ['GEMINI_HOME']) / 'antigravity-acp/{filename}'\n"
+                    f"    p = Path(sys.argv[sys.argv.index('--gemini-dir') + 1]) / 'antigravity-acp/{filename}'\n"
                     "    p.write_text('{\"token\": {\"access_token\": \"test-access\"}}')\n"
                 )
                 program.chmod(0o700)
@@ -514,122 +594,17 @@ class SwitcherCoreTestSuite(unittest.TestCase):
         self.assertTrue(ok_big)
         self.assertEqual(mock_ct.call_count, 1)
 
-    def test_retrieve_user_quota_summary_5h_weekly_and_argon(self):
-        tok = make_fake_token("ya29.valid", "1//rf_tok")
-        seen_headers = {}
-
-        def fake_urlopen(req, timeout=3.5):
-            ua = req.headers.get("User-agent") or req.headers.get("User-Agent") or ""
-            if "retrieveUserQuotaSummary" in req.full_url:
-                seen_headers["summary_ua"] = ua
-                return FakeHTTPResponse({
-                    "groups": [
-                        {
-                            "displayName": "Gemini Models",
-                            "description": "Models within this group: Gemini 3.8 Flash",
-                            "buckets": [
-                                {"bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "resetTime": "2099-01-07T00:00:00Z", "remainingFraction": 0.79},
-                                {"bucketId": "gemini-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "resetTime": "2099-01-01T05:00:00Z", "remainingFraction": 0.67},
-                            ],
-                        },
-                        {
-                            "displayName": "Claude and GPT models",
-                            "description": "Models within this group: Claude Opus 5.5, Claude Sonnet 5.5, GPT-OSS 120B",
-                            "buckets": [
-                                {"bucketId": "3p-weekly", "displayName": "Weekly Limit Remaining", "window": "weekly", "resetTime": "2099-01-07T00:00:00Z", "remainingFraction": 1.0},
-                                {"bucketId": "3p-5h", "displayName": "Five Hour Limit Remaining", "window": "5h", "resetTime": "2099-01-01T05:00:00Z", "remainingFraction": 1.0},
-                            ],
-                        },
-                        {
-                            "displayName": "Gemini 4 Argon",
-                            "buckets": [
-                                {"bucketId": "gemini-argon-wtu-weekly", "displayName": "Gemini 4 Argon Weekly Limit", "window": "weekly", "resetTime": "2099-01-07T22:00:00Z", "remainingFraction": 0.87},
-                            ],
-                        },
-                    ]
-                })
-            if "fetchAvailableModels" in req.full_url:
-                seen_headers["models_ua"] = ua
-                return FakeHTTPResponse({"models": {}})
-            if "loadCodeAssist" in req.full_url:
-                seen_headers["lca_ua"] = ua
-                return FakeHTTPResponse({
-                    "currentTier": {"id": "free-tier", "name": "Antigravity"},
-                    "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"},
-                })
-            raise AssertionError(f"Unexpected URL: {req.full_url}")
-
-        with patch.object(sc.urllib.request, "urlopen", side_effect=fake_urlopen):
-            usage = sc.fetch_antigravity_usage(tok, known_email="user@example.invalid")
-
-        self.assertIsNotNone(usage)
-        self.assertTrue(seen_headers.get("summary_ua", "").startswith("antigravity/hub/"))
-        self.assertTrue(seen_headers.get("models_ua", "").startswith("antigravity/hub/"))
-        self.assertEqual(usage["tier"], "Google AI Pro")
-        self.assertEqual(usage["daily"]["window_label"], "5h limit")
-        self.assertAlmostEqual(usage["daily"]["remaining_pct"], 67.0)
-        self.assertEqual(usage["weekly"]["window_label"], "Weekly limit")
-        self.assertAlmostEqual(usage["weekly"]["remaining_pct"], 79.0)
-        names = [p["name"] for p in usage["pools"]]
-        self.assertEqual(
-            names,
-            [
-                "Gemini Models — 5h limit",
-                "Gemini Models — Weekly limit",
-                "Claude and GPT models — 5h limit",
-                "Claude and GPT models — Weekly limit",
-                "Gemini 4 Argon — Weekly limit",
-            ],
-        )
-        argon = next(p for p in usage["pools"] if "Argon" in p["name"])
-        self.assertAlmostEqual(argon["remaining_pct"], 87.0)
-        self.assertEqual(argon["window_label"], "Weekly limit")
-
-    def test_exhausted_omitted_fraction_and_gcp_tos_routing(self):
-        tok = make_fake_token("ya29.valid", "1//rf_tok")
-        urls = []
-
-        def fake_urlopen(req, timeout=3.5):
-            urls.append(req.full_url)
-            if "loadCodeAssist" in req.full_url:
-                return FakeHTTPResponse({
-                    "cloudaicompanionProject": {"id": "my-gcp-proj"},
-                    "currentTier": {"id": "standard-tier", "usesGcpTos": True},
-                })
-            if "retrieveUserQuotaSummary" in req.full_url:
-                return FakeHTTPResponse({
-                    "groups": [{
-                        "buckets": [
-                            {"bucketId": "gemini-5h", "window": "5h"},
-                            {"bucketId": "gemini-argon-wtu-weekly", "window": "weekly", "remainingFraction": 0.5},
-                        ]
-                    }]
-                })
-            if "fetchAvailableModels" in req.full_url:
-                return FakeHTTPResponse({"models": {}})
-            raise AssertionError(f"Unexpected URL: {req.full_url}")
-
-        with patch.object(sc.urllib.request, "urlopen", side_effect=fake_urlopen):
-            usage = sc.fetch_antigravity_usage(tok, known_email="user@example.invalid")
-
-        self.assertIsNotNone(usage)
-        self.assertTrue(any(u.startswith("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary") for u in urls))
-        self.assertAlmostEqual(usage["daily"]["remaining_pct"], 0.0)
-        argon = next(p for p in usage["pools"] if "Argon" in p["name"])
-        self.assertEqual(argon["group_name"], "Gemini 4 Argon")
-        self.assertAlmostEqual(argon["remaining_pct"], 50.0)
-
     def test_agy_cli_env_and_normalize_credential(self):
         env = sc._build_agy_login_env(
-            {"PATH": "/usr/bin", "GEMINI_API_KEY": "bad", "DISPLAY": ":0"},
+            {"PATH": "/usr/bin", "GEMINI_API_KEY": "bad", "DISPLAY": ":0", "SSH_CONNECTION": "1 2 3 4"},
             "/tmp/ag_prof",
             "/tmp/ag_prof/tmp",
         )
         self.assertNotIn("GEMINI_API_KEY", env)
         self.assertNotIn("DISPLAY", env)
-        self.assertEqual(env["AGY_ACP_FORCE_FILE_STORAGE"], "1")
-        self.assertTrue(env["SSH_CONNECTION"])
-        self.assertEqual(env["GEMINI_HOME"], "/tmp/ag_prof")
+        self.assertEqual(env["AGY_CLI_FORCE_FILE_TOKEN_STORAGE"], "1")
+        self.assertNotIn("SSH_CONNECTION", env)
+        self.assertNotIn("GEMINI_HOME", env)
 
         flat_norm = sc._normalize_official_credential(
             json.dumps({"access_token": "ya29.flat", "refresh_token": "1//rf"}),
@@ -665,112 +640,6 @@ class SwitcherCoreTestSuite(unittest.TestCase):
         status = sc.get_status_payload(cached_only=True)
         self.assertEqual(status["active_key"], "rotated-account@example.invalid")
         self.assertFalse(status["active_session_unsaved"])
-
-    def test_select_warmup_gemini_model_and_ping(self):
-        with_hydrogen = {
-            "models": {
-                "gemini-3.8-flash-low": {"displayName": "Gemini 3.8 Flash", "quotaInfo": {}},
-                "gemini-4-hydrogen": {"displayName": "Gemini 4 Hydrogen", "quotaInfo": {}},
-                "claude-opus-5-5": {"displayName": "Claude Opus 5.5", "quotaInfo": {}},
-            }
-        }
-        self.assertEqual(sc.select_warmup_gemini_model(with_hydrogen), ("gemini-4-hydrogen", "Gemini 4 Hydrogen"))
-
-        without_hydrogen = {
-            "models": {
-                "gemini-3.8-flash": {"displayName": "Gemini 3.8 Flash", "quotaInfo": {}},
-                "gemini-4-argon": {"displayName": "Gemini 4 Argon", "quotaInfo": {}},
-            }
-        }
-        self.assertEqual(sc.select_warmup_gemini_model(without_hydrogen), ("gemini-3.8-flash", "Gemini 3.8 Flash"))
-
-        tok = make_fake_token("ya29.warm", "1//rf_warm")
-        seen_gen = []
-
-        def fake_urlopen(req, timeout=3.5):
-            if "loadCodeAssist" in req.full_url:
-                return FakeHTTPResponse({"cloudaicompanionProject": "proj-123"})
-            if "fetchAvailableModels" in req.full_url:
-                return FakeHTTPResponse(with_hydrogen)
-            if "v1internal:generateContent" in req.full_url:
-                body = json.loads(req.data.decode("utf-8"))
-                seen_gen.append(body)
-                return FakeHTTPResponse({"response": {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]}})
-            raise AssertionError(f"Unexpected URL: {req.full_url}")
-
-        with patch.object(sc.urllib.request, "urlopen", side_effect=fake_urlopen):
-            ok, model_disp, err = sc.send_gemini_warmup_ping(tok)
-
-        self.assertTrue(ok, err)
-        self.assertEqual(model_disp, "Gemini 4 Hydrogen")
-        self.assertIsNone(err)
-        self.assertEqual(len(seen_gen), 1)
-        self.assertEqual(seen_gen[0]["model"], "gemini-4-hydrogen")
-        self.assertEqual(seen_gen[0]["project"], "proj-123")
-        self.assertEqual(seen_gen[0]["request"]["generationConfig"]["maxOutputTokens"], 1)
-
-    def test_warmup_uses_advertised_flash_low_after_hydrogen_rejection(self):
-        token = make_fake_token()
-        attempted = []
-
-        def post(endpoint, access_token, payload, **kwargs):
-            if endpoint == "loadCodeAssist":
-                return 200, {"cloudaicompanionProject": "test-project"}
-            if endpoint == "fetchAvailableModels":
-                return 200, {"models": {
-                    "gemini-4-hydrogen": {"displayName": "Gemini 4 Hydrogen"},
-                    "gemini-3.8-flash": {"displayName": "Gemini 3.8 Flash"},
-                    "gemini-3.8-flash-low": {"displayName": "Gemini 3.8 Flash (Low)"},
-                }}
-            attempted.append(payload["model"])
-            if payload["model"] == "gemini-3.8-flash-low":
-                return 200, {"response": {"candidates": [{"finishReason": "MAX_TOKENS"}]}}
-            return 400, {"error": {"message": "Model unavailable"}}
-
-        with patch.object(sc, "_post_cloudcode", side_effect=post):
-            ok, model, error = sc.send_gemini_warmup_ping(token)
-
-        self.assertTrue(ok, error)
-        self.assertEqual(model, "Gemini 3.8 Flash (Low)")
-        self.assertEqual(attempted, ["gemini-4-hydrogen", "gemini-3.8-flash-low"])
-
-    def test_warmup_recognizes_successful_event_stream(self):
-        class EventStream(FakeHTTPResponse):
-            def read(self):
-                return b'data: {"response":{"candidates":[{"finishReason":"STOP"}]}}\n\n'
-
-        def urlopen(request, timeout):
-            if request.full_url.endswith(":loadCodeAssist"):
-                return FakeHTTPResponse({})
-            if request.full_url.endswith(":fetchAvailableModels"):
-                return FakeHTTPResponse({"models": {"gemini-4-hydrogen": {}}})
-            if request.full_url.endswith(":streamGenerateContent?alt=sse"):
-                return EventStream({})
-            raise sc.urllib.error.HTTPError(request.full_url, 405, "Mock", {}, None)
-
-        with patch.object(sc.urllib.request, "urlopen", side_effect=urlopen):
-            ok, _, error = sc.send_gemini_warmup_ping(make_fake_token())
-
-        self.assertTrue(ok, error)
-
-    def test_warmup_stops_on_rate_limit_or_ambiguous_response(self):
-        for reply in ((429, None), (-1, None), (200, {"error": {"message": "Unknown"}})):
-            with self.subTest(status=reply[0]):
-                attempted = []
-
-                def post(endpoint, access_token, payload, **kwargs):
-                    if endpoint == "loadCodeAssist":
-                        return 200, {}
-                    if endpoint == "fetchAvailableModels":
-                        return 200, {"models": {"gemini-4-hydrogen": {}, "gemini-3.8-flash-low": {}}}
-                    attempted.append(payload["model"])
-                    return reply
-
-                with patch.object(sc, "_post_cloudcode", side_effect=post):
-                    ok, _, _ = sc.send_gemini_warmup_ping(make_fake_token())
-
-                self.assertFalse(ok)
-                self.assertEqual(attempted, ["gemini-4-hydrogen"])
 
 
 if __name__ == "__main__":

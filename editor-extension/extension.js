@@ -245,8 +245,8 @@ function activate(context) {
         });
 
         items.push({
-            label: '📊 View Quotas & Limits',
-            description: 'Live model limits dashboard',
+            label: '📊 Check All Quotas',
+            description: 'Runs the official Antigravity CLI once per account',
             action: 'usage'
         });
 
@@ -286,7 +286,10 @@ function activate(context) {
             vscode.window.showInformationMessage('Starting Add Account Wizard...');
             await runAction(bin, ['--wizard'], 'GravityBar could not open the sign-in wizard.');
         } else if (selected.action === 'usage') {
-            await runAction(bin, ['--usage-gui', '--force-refresh', '--quiet'], 'GravityBar could not open the quota dashboard.');
+            await vscode.window.withProgress(
+                { location: vscode.ProgressLocation.Notification, title: 'GravityBar: checking quotas with the Antigravity CLI…' },
+                () => runAction(bin, ['--usage-gui', '--force-refresh', '--quiet'], 'GravityBar could not open the quota dashboard.')
+            );
         } else if (selected.action === 'save') {
             const label = await vscode.window.showInputBox({
                 prompt: 'Enter a name or label for this account:',

@@ -223,6 +223,7 @@ struct AccountsMainView: View {
                                 isSwitching: store.switchingKey == account.key,
                                 isAnySwitching: store.switchingKey != nil,
                                 isSyncing: store.isLoading || store.isRefreshing,
+                                quotaError: store.quotaErrors[account.key],
                                 onToggleExpand: { store.toggleExpanded(account.key) },
                                 onConfirmSwitch: {
                                     store.pendingConfirmKey = nil
@@ -251,7 +252,7 @@ struct AccountsMainView: View {
                 Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(.secondary)
-                Text(QuotaHelpers.relativeSyncText(lastUpdated: store.lastUpdated, isRefreshing: store.isRefreshing))
+                Text(store.quotaProgress ?? QuotaHelpers.relativeSyncText(lastUpdated: store.lastUpdated, isRefreshing: store.isRefreshing))
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundColor(.primary)
                     .lineLimit(1)
@@ -281,12 +282,13 @@ struct AccountsMainView: View {
                 }
 
                 QuickStripPill(
-                    title: "Refresh",
+                    title: "Check",
                     systemImage: "arrow.clockwise",
                     isBusy: store.isRefreshing
                 ) {
-                    Task { await store.refresh(force: true) }
+                    Task { await store.refresh() }
                 }
+                .help("Check every saved account's quota once with the official Antigravity CLI")
                 .keyboardShortcut("r", modifiers: .command)
 
                 QuickStripPill(
@@ -401,6 +403,7 @@ struct AccountCardView: View {
     let isSwitching: Bool
     let isAnySwitching: Bool
     let isSyncing: Bool
+    let quotaError: String?
     let onToggleExpand: () -> Void
     let onConfirmSwitch: () -> Void
     let onCancelConfirm: () -> Void
@@ -607,6 +610,24 @@ struct AccountCardView: View {
                     .padding(.trailing, 8)
                     .help(isExpanded ? "Hide all quotas" : "Show all quotas (Gemini, Claude & GPT, Argon)")
                 }
+            }
+
+            if quotaError != nil || account.usage != nil {
+                VStack(alignment: .leading, spacing: 3) {
+                    if let checkedAt = account.usage?.checkedAt {
+                        let checked = Date(timeIntervalSince1970: TimeInterval(checkedAt))
+                        Text("Last checked \(checked.formatted(date: .abbreviated, time: .shortened))")
+                            .foregroundStyle(.secondary)
+                    } else if account.usage != nil {
+                        Text("Saved quota snapshot").foregroundStyle(.secondary)
+                    }
+                    if let quotaError {
+                        Text(quotaError).foregroundStyle(.orange)
+                    }
+                }
+                .font(.system(size: 10.5))
+                .padding(.horizontal, 12)
+                .padding(.bottom, 9)
             }
 
             if isPendingConfirm {
@@ -1406,44 +1427,10 @@ struct SettingsView: View {
                 Toggle("Play macOS sound effects", isOn: $store.playSounds)
                     .font(.system(size: 12.5))
 
-                Toggle("Auto-start 5h Gemini timer (Hydrogen / Flash)", isOn: $store.autoWarmup5hEnabled)
-                    .font(.system(size: 12.5))
-
-                HStack(spacing: 8) {
-                    Text(store.lastWarmupStatus.isEmpty ? "Sends a short ping when the 5h quota is idle" : store.lastWarmupStatus)
-                        .font(.system(size: 10.5))
-                        .foregroundColor(.secondary)
-                        .lineLimit(2)
-                    Spacer(minLength: 6)
-                    Button {
-                        Task { await store.triggerManualWarmup() }
-                    } label: {
-                        HStack(spacing: 4) {
-                            if store.isWarmingUp {
-                                ProgressView().controlSize(.mini)
-                            }
-                            Text(store.isWarmingUp ? "Pinging..." : "Ping Now")
-                                .font(.system(size: 11, weight: .medium))
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(store.isWarmingUp || store.accounts.isEmpty)
-                }
-
-                HStack {
-                    Text("Auto-refresh quotas")
-                        .font(.system(size: 12.5))
-                    Spacer()
-                    Picker("", selection: $store.autoRefreshMinutes) {
-                        Text("Manual").tag(0)
-                        Text("2 min").tag(2)
-                        Text("5 min").tag(5)
-                        Text("10 min").tag(10)
-                    }
-                    .labelsHidden()
-                    .frame(width: 115)
-                }
+                Text("Quotas are checked only when you press Check, using the official Antigravity CLI.")
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 Divider().opacity(0.45)
 
